@@ -4,11 +4,15 @@
 
 sp::DBus remote(&huart3);
 
+// 电机的控制逻辑在 motor_control.cpp 里实现
+extern "C" void motor_control_update(void);
+
 extern "C" void uart_task()
 {
   remote.request();
 
   while (true) {
+    motor_control_update();
     osDelay(10);
   }
 }

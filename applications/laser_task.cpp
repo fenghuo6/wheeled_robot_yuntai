@@ -9,28 +9,28 @@
 // 同时把 USART6、cboard.ioc 的波特率一并改掉，否则重新生成代码后会失配。
 namespace
 {
-constexpr uint8_t kFrameHeader = 0x5AU;
-constexpr uint8_t kDistanceFrameType = 0x15U;
-constexpr uint8_t kHeaderLength = 0x02U;    // 0x5A 0x5A
-constexpr uint8_t kPrefixLength = 0x04U;    // 帧头 2 字节 + 类型 1 字节 + 数据量 1 字节
-constexpr uint8_t kChecksumLength = 0x01U;
-constexpr uint8_t kMinFrameLength = 0x08U;  // 手册：每帧 8~13 字节
-constexpr uint8_t kMaxFrameLength = 0x0DU;
-constexpr uint32_t kRxBufferLength = 32U;
-constexpr uint32_t kOnlineTimeoutMs = 500U;
-constexpr uint32_t kTaskPeriodMs = 50U;
+constexpr uint8_t k_frame_header = 0x5AU;         // 帧头标志，两字节均为该值
+constexpr uint8_t k_distance_frame_type = 0x15U;  // Byte2 帧类型：距离数据帧
+constexpr uint8_t k_header_length = 0x02U;        // 帧头长度（字节），内容为 0x5A 0x5A
+constexpr uint8_t k_prefix_length = 0x04U;        // 帧头 2 字节 + 类型 1 字节 + 数据量 1 字节
+constexpr uint8_t k_checksum_length = 0x01U;      // 帧尾校验和长度（字节）
+constexpr uint8_t k_min_frame_length = 0x08U;     // 帧长下限（字节），手册：每帧 8~13 字节
+constexpr uint8_t k_max_frame_length = 0x0DU;     // 帧长上限（字节）
+constexpr uint32_t k_rx_buffer_length = 32U;      // DMA 接收缓冲区长度（字节）
+constexpr uint32_t k_online_timeout_ms = 500U;    // 超过该时间未收到有效帧即判离线（ms）
+constexpr uint32_t k_task_period_ms = 50U;        // 在线状态刷新周期（ms）
 
-uint8_t rx_buffer[kRxBufferLength];
-uint8_t frame[kMaxFrameLength];
-uint8_t frame_size = 0U;
-uint8_t frame_length = 0U;
-volatile uint32_t last_valid_frame_ms = 0U;
+uint8_t rx_buffer[k_rx_buffer_length];       // DMA 写入的原始字节
+uint8_t frame[k_max_frame_length];           // 逐字节组帧缓冲
+uint8_t frame_size = 0U;                     // 组帧进度：已写入 frame 的字节数
+uint8_t frame_length = 0U;                   // 当前帧总长，由 Byte3 算出，组帧过程中有效
+volatile uint32_t last_valid_frame_ms = 0U;  // 最近一帧通过校验的时刻（ms），用于判在线
 
 // 逐字节同步 0x5A 0x5A 帧头，按 Byte3 给出的数据量确定帧长并校验，最后更新测距结果。
 void parse_byte(uint8_t byte)
 {
-  if (frame_size < kHeaderLength) {
-    if (byte == kFrameHeader) {
+  if (frame_size < k_header_length) {
+    if (byte == k_frame_header) {
       frame[frame_size++] = byte;
     } else {
       frame_size = 0U;
@@ -40,12 +40,12 @@ void parse_byte(uint8_t byte)
 
   frame[frame_size++] = byte;
 
-  if (frame_size < kPrefixLength) return;
+  if (frame_size < k_prefix_length) return;
 
-  if (frame_size == kPrefixLength) {
+  if (frame_size == k_prefix_length) {
     const uint16_t total_length =
-      static_cast<uint16_t>(kPrefixLength) + frame[3] + kChecksumLength;
-    if (total_length < kMinFrameLength || total_length > kMaxFrameLength) {
+      static_cast<uint16_t>(k_prefix_length) + frame[3] + k_checksum_length;
+    if (total_length < k_min_frame_length || total_length > k_max_frame_length) {
       frame_size = 0U;
       return;
     }
@@ -60,13 +60,13 @@ void parse_byte(uint8_t byte)
   frame_length = 0U;
 
   uint8_t checksum = 0U;
-  for (uint8_t i = 0U; i < length - kChecksumLength; ++i) checksum += frame[i];
-  if (checksum != frame[length - kChecksumLength]) {
+  for (uint8_t i = 0U; i < length - k_checksum_length; ++i) checksum += frame[i];
+  if (checksum != frame[length - k_checksum_length]) {
     ++g_gy56_checksum_errors;
     return;
   }
 
-  if (frame[2] != kDistanceFrameType) return;
+  if (frame[2] != k_distance_frame_type) return;
 
   g_gy56_distance_cm = static_cast<uint16_t>(
     (static_cast<uint16_t>(frame[4]) << 8U) | frame[5]);
@@ -78,19 +78,19 @@ void parse_byte(uint8_t byte)
 }
 
 // 对外发布的测距结果、在线状态和通信诊断信息。
-volatile uint16_t g_gy56_distance_cm = 0U;
-volatile uint8_t g_gy56_mode = 0U;
-volatile uint8_t g_gy56_temperature_c = 0U;
-volatile uint8_t g_gy56_online = 0U;
-volatile uint32_t g_gy56_valid_frames = 0U;
-volatile uint32_t g_gy56_checksum_errors = 0U;
-volatile uint8_t g_gy56_uart_error = HAL_OK;
+volatile uint16_t g_gy56_distance_cm = 0U;       // 最近一帧的距离（cm）
+volatile uint8_t g_gy56_mode = 0U;               // 测量模式：0 长距离 / 1 快速 / 2 高精度 / 3 一般
+volatile uint8_t g_gy56_temperature_c = 0U;      // 模块 MCU 温度（℃）
+volatile uint8_t g_gy56_online = 0U;             // 1 表示 k_online_timeout_ms 内收到过有效帧
+volatile uint32_t g_gy56_valid_frames = 0U;      // 通过校验的帧累计数，通信诊断用
+volatile uint32_t g_gy56_checksum_errors = 0U;   // 校验失败累计数，通信诊断用
+volatile uint8_t g_gy56_uart_error = HAL_OK;     // 最近 UART 状态/错误码（HAL_OK 或 HAL_UART_ERROR_*）
 
 // 启动 USART6 的 DMA 空闲接收。
 void gy56_uart_start_receive(void)
 {
   const HAL_StatusTypeDef status =
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart6, rx_buffer, kRxBufferLength);
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart6, rx_buffer, k_rx_buffer_length);
   g_gy56_uart_error = static_cast<uint8_t>(status);
   if (status == HAL_OK) __HAL_DMA_DISABLE_IT(huart6.hdmarx, DMA_IT_HT);
 }
@@ -98,7 +98,7 @@ void gy56_uart_start_receive(void)
 // 处理一批 DMA 收到的数据，并重新启动接收。
 void gy56_uart_receive_event(uint16_t size)
 {
-  for (uint16_t i = 0U; i < size && i < kRxBufferLength; ++i) {
+  for (uint16_t i = 0U; i < size && i < k_rx_buffer_length; ++i) {
     parse_byte(rx_buffer[i]);
   }
   gy56_uart_start_receive();
@@ -120,7 +120,7 @@ extern "C" void gy56_laser_task(void const * argument)
   for (;;) {
     const uint32_t now_ms = static_cast<uint32_t>(osKernelSysTick());
     g_gy56_online =
-      (g_gy56_valid_frames > 0U && now_ms - last_valid_frame_ms <= kOnlineTimeoutMs) ? 1U : 0U;
-    osDelay(kTaskPeriodMs);
+      (g_gy56_valid_frames > 0U && now_ms - last_valid_frame_ms <= k_online_timeout_ms) ? 1U : 0U;
+    osDelay(k_task_period_ms);
   }
 }

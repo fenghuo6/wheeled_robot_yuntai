@@ -1,7 +1,7 @@
 #include "cmsis_os.h"
 #include "io/plotter/plotter.hpp"
 #include "laser_task.hpp"
-#include "motor_task.hpp"
+#include "motor_task/motor_task.hpp"
 #include "tools/mahony/mahony.hpp"
 #include "trajectory_task/trajectory_task.hpp"
 
