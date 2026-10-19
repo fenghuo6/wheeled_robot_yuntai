@@ -734,6 +734,9 @@ constexpr TrajectoryPoint scale(const TrajectoryPoint & point)
 }
 constexpr TrajectoryPoint kInitialPoint = scale(kTrajectory[0]);
 
+// 当前相位（ms）。只在本文件内使用，读写都在临界区内。
+uint32_t s_phase_ms = 0U;
+
 void publish(const TrajectoryPoint & point)
 {
   taskENTER_CRITICAL();
@@ -754,6 +757,8 @@ volatile float yaw_acc = kInitialPoint.yaw_acc;
 volatile float pitch = kInitialPoint.pitch;
 volatile float pitch_vel = kInitialPoint.pitch_vel;
 volatile float pitch_acc = kInitialPoint.pitch_acc;
+// 上电默认停在起点，等控制层确认云台已对齐后再放行。
+volatile uint8_t g_trajectory_running = 0U;
 }
 
 extern "C" TrajectoryPoint trajectory_sample_at_ms(uint32_t elapsed_ms)
@@ -781,18 +786,45 @@ extern "C" TrajectoryPoint trajectory_read(void)
   return point;
 }
 
+extern "C" void trajectory_start(void)
+{
+  taskENTER_CRITICAL();
+  s_phase_ms = 0U;
+  g_trajectory_running = 1U;
+  taskEXIT_CRITICAL();
+}
+
+extern "C" void trajectory_pause(void)
+{
+  taskENTER_CRITICAL();
+  g_trajectory_running = 0U;
+  s_phase_ms = 0U;
+  taskEXIT_CRITICAL();
+  publish(kInitialPoint);
+}
+
 extern "C" void trajectory_task(void const * argument)
 {
   (void)argument;
   TickType_t previous_tick = xTaskGetTickCount();
-  uint32_t phase_ms = 0U;
-  publish(trajectory_sample_at_ms(0U));
+  publish(kInitialPoint);
   for (;;) {
     const TickType_t now = xTaskGetTickCount();
     const TickType_t delta_ticks = now - previous_tick;
     previous_tick = now;
-    phase_ms = (phase_ms + delta_ticks % TRAJECTORY_PERIOD_MS) % TRAJECTORY_PERIOD_MS;
-    publish(trajectory_sample_at_ms(phase_ms));
+
+    if (g_trajectory_running) {
+      taskENTER_CRITICAL();
+      s_phase_ms = (s_phase_ms + delta_ticks % TRAJECTORY_PERIOD_MS) % TRAJECTORY_PERIOD_MS;
+      const uint32_t phase_ms = s_phase_ms;
+      taskEXIT_CRITICAL();
+      publish(trajectory_sample_at_ms(phase_ms));
+    }
+    else {
+      // 未放行：持续发布起点值，控制层据此把云台对齐到轨迹开始位置。
+      publish(kInitialPoint);
+    }
+
     TickType_t wake_tick = now;
     vTaskDelayUntil(&wake_tick, pdMS_TO_TICKS(TRAJECTORY_UPDATE_INTERVAL_MS));
   }

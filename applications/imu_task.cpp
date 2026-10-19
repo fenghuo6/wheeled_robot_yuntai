@@ -1,4 +1,5 @@
 #include "cmsis_os.h"
+#include "imu_task.hpp"
 #include "io/bmi088/bmi088.hpp"
 #include "tools/mahony/mahony.hpp"
 
@@ -11,6 +12,7 @@ sp::Mahony imu(1e-3f);
 volatile float g_yaw_rad = 0.0f;
 volatile float g_pitch_rad = 0.0f;
 volatile float g_roll_rad = 0.0f;
+volatile uint32_t g_imu_update_ms = 0U;
 
 extern "C" void imu_task()
 {
@@ -23,6 +25,7 @@ extern "C" void imu_task()
     g_yaw_rad = imu.yaw;
     g_pitch_rad = imu.pitch;
     g_roll_rad = imu.roll;
+    g_imu_update_ms = static_cast<uint32_t>(osKernelSysTick());
 
     osDelay(1);
   }

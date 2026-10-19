@@ -8,18 +8,18 @@
 extern "C" {
 #endif
 
-// 电机配置：motor_a/b 为 GM6020（ID 1/2，电流控制帧 0x1FE），
-// motor_c 为 C610 驱动的 M2006（ID 3，控制帧 0x200）。
-// 单位均为输出轴侧：角度 rad、转速 rad/s、转矩 N·m、温度 ℃；
-// M2006 已按 36:1 减速比换算。
-
-// 指令输入：其他模块写入，motor_task 每 1 ms 下发一次。初值 0，上电不会输出转矩。
-// 量程：motor_a/b 为 ±2.223 N·m，motor_c 为 ±1.8 N·m，超出部分由驱动自动限幅。
-// 注意：g_motor_pid_enable 为 1 时，三个电机的指令均由环路（速度环或角度双环）写入，
-// 此时不要再从外部写这三个量。
-extern volatile float g_motor_a_cmd;
-extern volatile float g_motor_b_cmd;
-extern volatile float g_motor_c_cmd;
+// ============================================================================
+// 电机任务对外接口
+// ----------------------------------------------------------------------------
+// 硬件：motor_a/b 为 GM6020（ID 1/2，电流控制帧 0x1FE），
+//       motor_c 为 C610 驱动的 M2006（ID 3，控制帧 0x200）。
+// 角色：a = yaw，b = 折叠，c = pitch（与 sp::Gimbal 无关，折叠轴单独保持）。
+// 单位：角度 rad、转速 rad/s、转矩 N·m、温度 ℃，均为输出轴侧；
+//       M2006 已按 36:1 减速比换算。
+//
+// 分层：motor_task.cpp 是唯一操作 CAN 与 PID 的模块；
+//       motor_control.cpp 只写本文件的"使能/目标"全局量，不碰底层。
+// ============================================================================
 
 // 电机编号：控制层用于区分三个电机（如 motor_control.cpp 里的辅助函数）
 typedef enum
@@ -29,40 +29,52 @@ typedef enum
   MOTOR_C = 2,
 } MotorId;
 
-// 控制模式：g_motor_*_mode 的取值
-typedef enum
-{
-  MOTOR_MODE_SPEED = 0,  // 单速度环：跟踪 g_motor_*_speed_set
-  MOTOR_MODE_ANGLE = 1,  // 双环（角度外环 + 速度内环）：转到并保持在 g_motor_*_angle_set
-} MotorControlMode;
-
-// 电机速度环使能：1 时各电机按各自模式跟踪指定目标，0 时停止输出转矩；默认 0。
+// ─────────────────────── 1. 使能与模式 ───────────────────────
+// 角度环使能：1 时三个电机跟踪各自目标，0 时停止输出转矩；默认 0。
 extern volatile bool g_motor_pid_enable;
 
-// 速度环目标转速（rad/s，输出轴侧）：速度模式下生效，默认 0。
-// 例：120 rpm = 120 × 2π / 60 ≈ 12.57 rad/s。
-extern volatile float g_motor_a_speed_set;
-extern volatile float g_motor_b_speed_set;
-extern volatile float g_motor_c_speed_set;
+// 轨迹跟随模式：1 时 a(yaw)/c(pitch) 以 IMU 的世界系姿态为反馈，
+// 跟踪下面的 g_gimbal_*_set；0 时按 g_motor_*_angle_set 以电机编码器为反馈。
+// 折叠轴 b 不受本开关影响，始终锁位保持。
+extern volatile bool g_gimbal_traj_enable;
 
-// 控制模式（取值见 MotorControlMode）：默认 MOTOR_MODE_SPEED。
-extern volatile uint8_t g_motor_a_mode;
-extern volatile uint8_t g_motor_b_mode;
-extern volatile uint8_t g_motor_c_mode;
+// ─────────────────────── 2. 目标值 ───────────────────────
+// 轨迹跟随的世界系目标角（rad），由 trajectory_task 的曲线给出。
+extern volatile float g_gimbal_yaw_set;
+extern volatile float g_gimbal_pitch_set;
 
-// 位置环目标角度（rad，输出轴侧）：角度模式下生效，默认 0。
-// 角度基准为电机编码器零点；要相对当前位置转固定角，写 当前角度 + 增量。
+// 相对本次使能位置的转角（rad），默认 0 表示保持使能时的姿态。
+// 零点由 motor_task 在每次使能后第一次拿到有效反馈时自动锁存，外部无需回零。
+// 轨迹跟随开启时 a/c 忽略本组值，改用 g_gimbal_*_set。
+// b(折叠)始终使用本值：改它就能驱动折叠/展开（如 motor_angle(MOTOR_B, deg)）。
 extern volatile float g_motor_a_angle_set;
 extern volatile float g_motor_b_angle_set;
 extern volatile float g_motor_c_angle_set;
 
-// 状态输出：由 motor_task 刷新。
+// ─────────────────────── 3. 指令（只读，供观察） ───────────────────────
+// 本周期下发的转矩指令，由 motor_task 每 1 ms 刷新。
+// 量程：motor_a/b 为 ±2.223 N·m，motor_c 为 ±1.8 N·m，超出部分由驱动自动限幅。
+// 注意：g_motor_pid_enable 为 1 时这三个量由角度环写入，此时不要再从外部写。
+extern volatile float g_motor_a_cmd;
+extern volatile float g_motor_b_cmd;
+extern volatile float g_motor_c_cmd;
+
+// ─────────────────────── 4. 反馈状态 ───────────────────────
+// 角度 rad、转速 rad/s、转矩 N·m、温度 ℃、在线状态，均由 motor_task 刷新。
 extern volatile float g_motor_a_angle;
 extern volatile float g_motor_b_angle;
 extern volatile float g_motor_c_angle;
 extern volatile float g_motor_a_speed;
 extern volatile float g_motor_b_speed;
 extern volatile float g_motor_c_speed;
+
+// 相对本次使能位置的转角(rad)，只读，用于观察/调参。
+// 与 g_motor_*_angle_set 同一基准，因此"目标 vs 实际"可以直接对比：
+//   目标 - 本值 = 角度误差。
+// 未使能或零点尚未锁存（还没收到第一帧反馈）时为 0。
+extern volatile float g_motor_a_angle_rel;
+extern volatile float g_motor_b_angle_rel;
+extern volatile float g_motor_c_angle_rel;
 extern volatile float g_motor_a_torque;
 extern volatile float g_motor_b_torque;
 extern volatile float g_motor_c_torque;
@@ -73,6 +85,7 @@ extern volatile bool g_motor_a_online;
 extern volatile bool g_motor_b_online;
 extern volatile bool g_motor_c_online;
 
+// ─────────────────────── 5. 任务入口 ───────────────────────
 void motor_task(void const * argument);
 
 #ifdef __cplusplus

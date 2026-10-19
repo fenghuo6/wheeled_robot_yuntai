@@ -25,6 +25,10 @@ extern volatile float pitch;
 extern volatile float pitch_vel;
 extern volatile float pitch_acc;
 
+// 轨迹推进使能：0 时停在起点(t=0)并把起点值持续发布，1 时正常推进。
+// 上电默认 0，即轨迹先不跑；由控制层在对齐完成后调用 trajectory_start() 放行。
+extern volatile uint8_t g_trajectory_running;
+
 typedef struct
 {
   float yaw;
@@ -40,6 +44,12 @@ void trajectory_task(void const * argument);
 TrajectoryPoint trajectory_read(void);
 
 TrajectoryPoint trajectory_sample_at_ms(uint32_t elapsed_ms);
+
+// 从起点放行：相位归零后开始推进。
+void trajectory_start(void);
+
+// 停住并回到起点；之后 trajectory_read() 恒返回起点值。
+void trajectory_pause(void);
 
 #ifdef __cplusplus
 }
