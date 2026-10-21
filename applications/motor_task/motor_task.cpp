@@ -116,7 +116,11 @@ namespace
   //   第 3 步(I): 见下方 k_angle_ki 处说明。
   // 单位: kp 为 N·m/rad, ki 为 N·m/(rad·s), kd 为 N·m/(rad/s)。
   constexpr float k_angle_kp = 2.0f;        // 已定, 不再改
-  constexpr float k_angle_ki = 0.01f;       // 消静差(当前值偏小, 静差消除较慢)
+  // ki 原为 0.01 —— 那是"只看阶跃静差"时留下的值, 太小了: 0.01×0.1rad ≈ 0.001N·m/s,
+  // 要 200s 才能积出 0.2N·m 顶摩擦, 等于没有积分。
+  // 轨迹跟随实测暴露了后果: yaw 误差 ±5° 且峰值出现在极值处(死区特征),
+  // 与"摩擦/kp = 0.23/2 = 6.6°"的推算吻合。按 pitch 的同一量级改成 5。
+  constexpr float k_angle_ki = 5.0f;        // 消摩擦死区, 与 pitch 同量级
   constexpr float k_angle_kd = 0.0f;        // 保持 0: 角度差分的 D 噪声太大
   constexpr float k_angle_damp = 0.0f;      // 保持 0: 速度阻尼会发散(转速符号待确认)
   constexpr float k_angle_max_iout = 0.5f;  // 积分上限要能覆盖摩擦(0.2~0.3N·m)
@@ -125,11 +129,27 @@ namespace
   // 不能沿用 yaw 的增益：减速箱带来更大的输出侧惯量与摩擦，且转速反馈按 36:1 缩小，
   // 动态特性完全不同，必须单独调。
   // 起始值与 yaw 相同，按阶跃响应逐步往下调（顺序：先 P，再 I）。
-  constexpr float k_pitch_kp = 2.0f;        // 起始值, 按 15° 阶跃响应调整
-  constexpr float k_pitch_ki = 0.0f;        // 先只调 P, 静差先不管
-  constexpr float k_pitch_kd = 0.0f;        // 同 yaw: 角度差分噪声大, 不用 D
-  constexpr float k_pitch_damp = 0.0f;      // 同 yaw: 速度阻尼方向待确认, 暂时关闭
-  constexpr float k_pitch_max_iout = 0.0f;  // 调 I 时再打开
+  // 【pitch 调参记录】
+  //   kp=1: 卡在误差 2.5° 处不动、目标反向时又冲过头 14° → 阶梯状(净力不足)
+  //   kp=3: 持续大幅振荡、振幅还在增长 → 已越过 Ku
+  //   => Ku 在 1~3 之间, 且这条轴阻尼极低, 纯 P 怎么取都不好, 必须加阻尼。
+  //   关键差别: M2006 有 36:1 减速箱, 输出侧角度分辨率是 GM6020 的 36 倍
+  //   (0.0012°/LSB, 1kHz 下差分噪声仅 0.02rad/s), 所以这里 kd 可用 ——
+  //   yaw 用不了 kd 正是因为 0.044°/LSB 会被放大成 0.77rad/s 的假转速。
+  //   kd 的物理含义就是阻尼系数: dout = kd × 转速, 单位 N·m/(rad/s)。
+  constexpr float k_pitch_kp = 2.0f;        // 落在 1~3 之间的已知可动点
+  // kp=2 + kd=0.2 实测: 平滑斜坡跟随、无过冲、无振荡, 力矩干净;
+  // 但到位后静差约 2°(高侧到 13°, 低侧到 1.5°)。原因是 kp×2° = 0.11N·m 被摩擦吃掉。
+  // 所以需要 I 慢慢积出这 0.11N·m:
+  //   增量/秒 = ki × 误差 = 5 × 0.035 ≈ 0.18N·m/s, 约 0.6s 补足, 短于 1s 半周期。
+  //   max_iout 必须 ≥ 摩擦(≈0.11), 取 0.6 留余量; 它同时限制大阶跃时的积分卷绕。
+  // 若出现"到位后来回蹭"(积分过冲), 只降 ki: 5 → 3 → 2, 不要动 kp/kd。
+  constexpr float k_pitch_ki = 5.0f;        // 消静差
+  constexpr float k_pitch_kd = 0.2f;        // 阻尼; 由 J≈0.0045kg·m² 估算临界值≈0.19
+  constexpr float k_pitch_damp = 0.0f;      // 用 PID 内部 kd 即可, 不再用电机转速阻尼
+  constexpr float k_pitch_max_iout = 1.0f;  // 必须打开, 否则积分被限成 0 等于没加;
+                                            // 0.6 在 pitch 绝对 -10° 的姿态下不够(实测被卡满后留 1.94° 固定误差),
+                                            // 抬到 1.0, 仍小于 max_out 1.2
 
   // ---- 3.2 折叠轴(b)角度环 ----
   // 默认目标是"上电锁位"：首次收到有效反馈时把当时的角度写进 g_motor_b_angle_set，

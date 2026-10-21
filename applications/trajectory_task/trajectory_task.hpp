@@ -5,11 +5,21 @@
 
 // 单位：角度 rad、速度 rad/s、加速度 rad/s^2。
 
-#define TRAJECTORY_YAW_RANGE_DEG 45.0f
-#define TRAJECTORY_PITCH_RANGE_DEG 60.0f
+// 第一版接入先把轨迹做得又慢又小，确认"跟得上、没滞后"之后再放大：
+//   原参数 680ms + yaw45/pitch60 对应峰值 yaw 410°/s、pitch 476°/s，
+//   远超实测能力(yaw≈60°/s, pitch≈60°/s)，会全程饱和。
+//   现在: 5000ms + 20/20  → 峰值 yaw 25°/s、pitch 22°/s，行程 ±10°。
+//   确认机械能到 ±10° 且跟踪良好后，再把两个 RANGE 改回 45/60、PERIOD 逐步减小。
+#define TRAJECTORY_YAW_RANGE_DEG 20.0f
+#define TRAJECTORY_PITCH_RANGE_DEG 20.0f
 
 #define TRAJECTORY_SAMPLE_INTERVAL_MS 1U
-#define TRAJECTORY_PERIOD_MS 680U
+// 第一版接入时先把轨迹放慢：原 680ms 一个周期时 yaw 峰值 410°/s、pitch 峰值 476°/s，
+// 远超两条轴实测能力(yaw≈60°/s, pitch≈60°/s)，会全程饱和、跟踪严重滞后。
+// 5000ms: 峰值 yaw 25.6°/s、pitch 22.2°/s，实测误差 yaw ±3°、pitch ±6°，平滑不发散。
+// 【不要再往下放慢】试过 10000ms(峰值减半)：误差反而变大且出现周期性"蹭动"振荡 ——
+// 低速时轴频繁落入静摩擦区，走走停停叠加积分卷绕。也就是说精度瓶颈不是带宽，是摩擦。
+#define TRAJECTORY_PERIOD_MS 5000U
 #define TRAJECTORY_YAW_MAX_ACCELERATION_RAD_S2 110.0f
 #define TRAJECTORY_PITCH_MAX_ACCELERATION_RAD_S2 70.0f
 #define TRAJECTORY_UPDATE_INTERVAL_MS 1U
