@@ -24,7 +24,8 @@ uint8_t rx_buffer[k_rx_buffer_length];       // DMA 写入的原始字节
 uint8_t frame[k_max_frame_length];           // 逐字节组帧缓冲
 uint8_t frame_size = 0U;                     // 组帧进度：已写入 frame 的字节数
 uint8_t frame_length = 0U;                   // 当前帧总长，由 Byte3 算出，组帧过程中有效
-volatile uint32_t last_valid_frame_ms = 0U;  // 最近一帧通过校验的时刻（ms），用于判在线
+uint32_t last_valid_frame_ms = 0U;           // 最近一帧通过校验的时刻（ms），用于判在线
+bool has_valid_frame = false;                // 是否收到过有效帧
 
 // 逐字节同步 0x5A 0x5A 帧头，按 Byte3 给出的数据量确定帧长并校验，最后更新测距结果。
 void parse_byte(uint8_t byte)
@@ -61,10 +62,7 @@ void parse_byte(uint8_t byte)
 
   uint8_t checksum = 0U;
   for (uint8_t i = 0U; i < length - k_checksum_length; ++i) checksum += frame[i];
-  if (checksum != frame[length - k_checksum_length]) {
-    ++g_gy56_checksum_errors;
-    return;
-  }
+  if (checksum != frame[length - k_checksum_length]) return;
 
   if (frame[2] != k_distance_frame_type) return;
 
@@ -73,26 +71,22 @@ void parse_byte(uint8_t byte)
   g_gy56_mode = frame[6];
   if (frame[3] >= 0x04U) g_gy56_temperature_c = frame[7];
   last_valid_frame_ms = static_cast<uint32_t>(osKernelSysTick());
-  ++g_gy56_valid_frames;
+  has_valid_frame = true;
 }
 }
 
-// 对外发布的测距结果、在线状态和通信诊断信息。
+// 对外发布的测距结果与在线状态。
 volatile uint16_t g_gy56_distance_cm = 0U;       // 最近一帧的距离（cm）
 volatile uint8_t g_gy56_mode = 0U;               // 测量模式：0 长距离 / 1 快速 / 2 高精度 / 3 一般
 volatile uint8_t g_gy56_temperature_c = 0U;      // 模块 MCU 温度（℃）
 volatile uint8_t g_gy56_online = 0U;             // 1 表示 k_online_timeout_ms 内收到过有效帧
-volatile uint32_t g_gy56_valid_frames = 0U;      // 通过校验的帧累计数，通信诊断用
-volatile uint32_t g_gy56_checksum_errors = 0U;   // 校验失败累计数，通信诊断用
-volatile uint8_t g_gy56_uart_error = HAL_OK;     // 最近 UART 状态/错误码（HAL_OK 或 HAL_UART_ERROR_*）
 
 // 启动 USART6 的 DMA 空闲接收。
 void gy56_uart_start_receive(void)
 {
-  const HAL_StatusTypeDef status =
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart6, rx_buffer, k_rx_buffer_length);
-  g_gy56_uart_error = static_cast<uint8_t>(status);
-  if (status == HAL_OK) __HAL_DMA_DISABLE_IT(huart6.hdmarx, DMA_IT_HT);
+  if (HAL_UARTEx_ReceiveToIdle_DMA(&huart6, rx_buffer, k_rx_buffer_length) == HAL_OK) {
+    __HAL_DMA_DISABLE_IT(huart6.hdmarx, DMA_IT_HT);
+  }
 }
 
 // 处理一批 DMA 收到的数据，并重新启动接收。
@@ -104,12 +98,8 @@ void gy56_uart_receive_event(uint16_t size)
   gy56_uart_start_receive();
 }
 
-// 记录 UART 错误，并尝试恢复接收。
-void gy56_uart_error(void)
-{
-  g_gy56_uart_error = static_cast<uint8_t>(HAL_UART_GetError(&huart6));
-  gy56_uart_start_receive();
-}
+// UART 出错后重新启动接收，让通信自行恢复。
+void gy56_uart_error(void) { gy56_uart_start_receive(); }
 
 // GY-56 任务入口：启动接收，并周期性更新传感器在线状态。
 extern "C" void gy56_laser_task(void const * argument)
@@ -120,7 +110,7 @@ extern "C" void gy56_laser_task(void const * argument)
   for (;;) {
     const uint32_t now_ms = static_cast<uint32_t>(osKernelSysTick());
     g_gy56_online =
-      (g_gy56_valid_frames > 0U && now_ms - last_valid_frame_ms <= k_online_timeout_ms) ? 1U : 0U;
+      (has_valid_frame && now_ms - last_valid_frame_ms <= k_online_timeout_ms) ? 1U : 0U;
     osDelay(k_task_period_ms);
   }
 }

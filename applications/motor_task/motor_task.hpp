@@ -30,11 +30,18 @@ typedef enum
 } MotorId;
 
 // ─────────────────────── 1. 使能与模式 ───────────────────────
-// 角度环使能：1 时三个电机跟踪各自目标，0 时停止输出转矩；默认 0。
+// 折叠轴(b)角度环使能：1 时 b 自锁保持目标角（顶住云台重力），0 时全部停止输出；
+// 默认 0，上电不出力。
 extern volatile bool g_motor_pid_enable;
 
+// a(yaw)/c(pitch) 角度环使能：默认 0 = 不出力、可自由转动（角度仍可读）。
+// 置 1 后该轴跟踪自己的目标：角度模式用编码器反馈，轨迹跟随模式用 IMU 反馈。
+// 与 b 的区别：b 恒随总使能自锁，a/c 必须单独打开。
+extern volatile bool g_motor_a_loop_enable;
+extern volatile bool g_motor_c_loop_enable;
+
 // 轨迹跟随模式：1 时 a(yaw)/c(pitch) 以 IMU 的世界系姿态为反馈，
-// 跟踪下面的 g_gimbal_*_set；0 时按 g_motor_*_angle_set 以电机编码器为反馈。
+// 跟踪下面的 g_gimbal_*_set；0 时 a/c 按 g_motor_*_angle_set 以编码器反馈（角度模式）。
 // 折叠轴 b 不受本开关影响，始终锁位保持。
 extern volatile bool g_gimbal_traj_enable;
 
@@ -45,7 +52,7 @@ extern volatile float g_gimbal_pitch_set;
 
 // 相对本次使能位置的转角（rad），默认 0 表示保持使能时的姿态。
 // 零点由 motor_task 在每次使能后第一次拿到有效反馈时自动锁存，外部无需回零。
-// 轨迹跟随开启时 a/c 忽略本组值，改用 g_gimbal_*_set。
+// a/c 的这组值只在轨迹跟随开启时有意义（角度模式下 a/c 不出力）。
 // b(折叠)始终使用本值：改它就能驱动折叠/展开（如 motor_angle(MOTOR_B, deg)）。
 extern volatile float g_motor_a_angle_set;
 extern volatile float g_motor_b_angle_set;
@@ -54,7 +61,7 @@ extern volatile float g_motor_c_angle_set;
 // ─────────────────────── 3. 指令（只读，供观察） ───────────────────────
 // 本周期下发的转矩指令，由 motor_task 每 1 ms 刷新。
 // 量程：motor_a/b 为 ±2.223 N·m，motor_c 为 ±1.8 N·m，超出部分由驱动自动限幅。
-// 注意：g_motor_pid_enable 为 1 时这三个量由角度环写入，此时不要再从外部写。
+// 注意：角度模式下只有 b 的指令由环路写入；a/c 恒为 0，不要从外部写。
 extern volatile float g_motor_a_cmd;
 extern volatile float g_motor_b_cmd;
 extern volatile float g_motor_c_cmd;
@@ -69,9 +76,8 @@ extern volatile float g_motor_b_speed;
 extern volatile float g_motor_c_speed;
 
 // 相对本次使能位置的转角(rad)，只读，用于观察/调参。
-// 与 g_motor_*_angle_set 同一基准，因此"目标 vs 实际"可以直接对比：
-//   目标 - 本值 = 角度误差。
-// 未使能或零点尚未锁存（还没收到第一帧反馈）时为 0。
+// 三个轴在使能后都会锁存零点，因此"目标 vs 实际"可以直接对比，手转电机也能读出转角。
+// a/c 不出力（无自锁），但相对角照常随实际转动变化，可直接用来观察角度。
 extern volatile float g_motor_a_angle_rel;
 extern volatile float g_motor_b_angle_rel;
 extern volatile float g_motor_c_angle_rel;
@@ -114,9 +120,6 @@ extern volatile float g_motor_b_pid_out;    // 不含前馈的 PID 输出(N·m)
 
 // ─────────────────────── 5. 任务入口 ───────────────────────
 void motor_task(void const * argument);
-
-// 反馈帧统一入口：CAN1(中断) 与 CAN2(轮询) 都从这里进来。
-extern "C" void motor_process_can_frame(uint32_t id, const uint8_t * data, bool extended);
 
 #ifdef __cplusplus
 }

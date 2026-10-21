@@ -51,7 +51,6 @@
 osThreadId defaultTaskHandle;
 osThreadId imuTaskHandle;
 osThreadId uartTaskHandle;
-osThreadId canTaskHandle;
 osThreadId ledTaskHandle;
 osThreadId buzzerTaskHandle;
 osThreadId plotterTaskHandle;
@@ -67,7 +66,6 @@ osThreadId motorTaskHandle;
 void StartDefaultTask(void const * argument);
 extern void imu_task(void const * argument);
 extern void uart_task(void const * argument);
-extern void can_task(void const * argument);
 extern void led_task(void const * argument);
 extern void buzzer_task(void const * argument);
 extern void plotter_task(void const * argument);
@@ -132,10 +130,6 @@ void MX_FREERTOS_Init(void) {
   /* definition and creation of uartTask */
   osThreadDef(uartTask, uart_task, osPriorityHigh, 0, 128);
   uartTaskHandle = osThreadCreate(osThread(uartTask), NULL);
-
-  /* definition and creation of canTask */
-  osThreadDef(canTask, can_task, osPriorityHigh, 0, 128);
-  canTaskHandle = osThreadCreate(osThread(canTask), NULL);
 
   /* definition and creation of ledTask */
   osThreadDef(ledTask, led_task, osPriorityIdle, 0, 128);

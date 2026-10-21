@@ -47,7 +47,6 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     applications/plotter_task.cpp
     sp_middleware/io/plotter/plotter.cpp
-    applications/can_task.cpp # <- 添加这一行
     applications/motor_task/motor_task.cpp
     applications/motor_task/motor_control.cpp
     sp_middleware/io/can/can.cpp # <- 添加这一行
