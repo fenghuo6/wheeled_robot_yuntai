@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdint>
 #include "cmsis_os.h"
 #include "imu_task.hpp"
@@ -180,8 +181,11 @@ extern "C" void motor_control_update(void)
   const bool imu_ok = static_cast<uint32_t>(now_ms - g_imu_update_ms) < IMU_STALE_TIMEOUT_MS;
 
   // ---- ① 安全检查 ----
-  // 轨迹跟随的两个轴必须反馈正常，任一掉线或过热立即停（折叠轴由 motor_task 自行处理）。
-  if (!g_motor_a_online || !g_motor_c_online) {
+  // 单轴掉线由 motor_task 内部处理：run_motor_loop() 发现该轴 is_alive() 为假就把它的
+  // 转矩指令清零，不影响其他轴。这里不能"任一轴掉线就整机停"，否则单电机台架测试
+  // （只接 motor_a）会因为没接的 motor_c 一直离线而永远不出力矩。
+  // 只有轨迹跟随必须 a/c 两轴都在线：目标在世界系，缺反馈时误差不再变化，环路会持续死推。
+  if (g_gimbal_traj_enable && (!g_motor_a_online || !g_motor_c_online)) {
     motor_enable(false);       // 反馈掉了（>100ms 无 CAN 帧），立即停
     trajectory_follow_abort(); // 轨迹回到起点，下次重新对齐
     return;
@@ -193,18 +197,149 @@ extern "C" void motor_control_update(void)
   }
 
   // ---- ② 启动流程：对齐 → 放行 → 跟随 ----
-  trajectory_follow_update(imu_ok);
+ // trajectory_follow_update(imu_ok);
 
   // ---- ③ 使能 ----
-  motor_enable(true);
+  //motor_enable(true);
 
   // ==========================================================================
   // 可选测试示例（默认全部注释，不影响当前行为）
   // 用法：去掉对应示例的注释符，并把上面的 trajectory_follow_update() 注释掉。
   // ==========================================================================
 
+  // ── 示例 0：开环力矩测试（排查"电机到底收不收指令"，完全不经过 PID）
+  //   把示例 1 的 motor_enable(true) 换成下面两行。此时 g_motor_a_cmd 由本函数直接写，
+  //   motor_task 只负责原样下发。0.3N·m 起步逐步加大(0.5 / 1.0)，电机应持续同向转动：
+  //   转了 → 电机与 CAN 通路没问题，问题在 PID 参数；不转 → 是模式/ID/接线问题。
+  //   注意：开环不会因电机堵转而自动降力，电机会一直加速直到撞限位/电源保护。
+  //         上面那次"冲一下然后停"就是开环的正常表现，测完必须立刻注释掉。
+  //   motor_enable(false);
+  //   g_motor_a_cmd = 0.5f;
+
+  // ── 折叠轴重力前馈标定 ────────────────────────────────────────────────
+  //   原理: 折叠轴在竖直平面内摆动, 重力矩 τ(θ)=m·g·r·cos(θ-θ0)=P·cosθ+Q·sinθ。
+  //   做法: 让折叠轴依次停在若干角度, 每个角度等到稳态后采样"绝对角 θ / 稳态指令 τ",
+  //         最后对 (θ,τ) 做线性最小二乘解出 P、Q, 直接写入前馈, 前馈立即生效。
+  //   结果同时发布到 g_fold_cal_amp / g_fold_cal_phase, 可抄进常量长期使用。
+  //   ⚠ 标定会主动移动折叠轴, 请先确认整个角度范围(0~45°)内没有障碍物。
+  //   ⚠ 标定值已固化在 motor_task.cpp 的 g_fold_ff_p / g_fold_ff_q 中,
+  //     正常使用时保持 false(上电不扫角度); 更换负载后再临时置 true 重标一次。
+  constexpr bool k_fold_cal_enable = false;
+  constexpr float k_cal_angles[] = {0.0f, 15.0f, 30.0f, 45.0f};
+  constexpr uint32_t k_cal_points = 4U;
+  constexpr uint32_t k_cal_settle_ms = 2000U;  // 每点先稳定 2s 再采样
+  constexpr uint32_t k_cal_sample_ms = 400U;   // 采样窗 0.4s(40 个控制周期)
+
+  struct FoldCal
+  {
+    uint32_t point = 0U;
+    uint32_t t_ms = 0U;
+    float sum_angle = 0.0f;
+    float sum_cmd = 0.0f;
+    uint32_t n = 0U;
+    float cost[k_cal_points] = {};  // Σcos²θ / Σcosθsinθ / Σsin²θ / Στcosθ / Στsinθ
+    float sx = 0.0f, sxy = 0.0f, sy = 0.0f, sxz = 0.0f, syz = 0.0f;
+  };
+  static FoldCal cal;
+
+  if (k_fold_cal_enable && g_fold_cal_state != 2U) {
+    // 阶段 A: 切换到本标定点
+    if (cal.n == 0U && cal.t_ms == 0U) {
+      cal.t_ms = now_ms;
+      cal.point = 0U;
+      g_fold_cal_state = 1U;
+    }
+    const float target_deg = k_cal_angles[cal.point];
+    motor_angle(MOTOR_B, target_deg);
+    motor_enable(true);
+
+    const uint32_t elapsed = now_ms - cal.t_ms;
+    if (elapsed >= k_cal_settle_ms && elapsed < k_cal_settle_ms + k_cal_sample_ms) {
+      // 阶段 B: 采样。用不含前馈的 PID 输出, 它正好等于维持该姿态所需的力矩。
+      cal.sum_angle += g_motor_b_angle;
+      cal.sum_cmd += g_motor_b_pid_out;
+      ++cal.n;
+    }
+    else if (elapsed >= k_cal_settle_ms + k_cal_sample_ms) {
+      // 阶段 C: 收下本点数据(40 点平均), 换下一个角度
+      if (cal.n > 0U) {
+        const float theta = cal.sum_angle / static_cast<float>(cal.n);
+        const float tau = cal.sum_cmd / static_cast<float>(cal.n);
+        const float c = std::cos(theta);
+        const float s = std::sin(theta);
+        cal.sx += c * c;
+        cal.sxy += c * s;
+        cal.sy += s * s;
+        cal.sxz += tau * c;
+        cal.syz += tau * s;
+      }
+      cal.sum_angle = 0.0f;
+      cal.sum_cmd = 0.0f;
+      cal.n = 0U;
+      cal.t_ms = now_ms;
+
+      if (cal.point + 1U >= k_cal_points) {
+        // 阶段 D: 最小二乘解 [sx sxy; sxy sy]·[P;Q] = [sxz; syz]
+        const float det = cal.sx * cal.sy - cal.sxy * cal.sxy;
+        if (std::fabs(det) > 1e-6f) {
+          g_fold_ff_p = (cal.sxz * cal.sy - cal.syz * cal.sxy) / det;
+          g_fold_ff_q = (cal.syz * cal.sx - cal.sxz * cal.sxy) / det;
+          g_fold_cal_amp = std::sqrt(g_fold_ff_p * g_fold_ff_p + g_fold_ff_q * g_fold_ff_q);
+          g_fold_cal_phase = std::atan2(g_fold_ff_q, g_fold_ff_p);
+        }
+        g_fold_cal_state = 2U;
+      }
+      else {
+        ++cal.point;
+      }
+    }
+  }
+  else {
+    // 正常折叠动作: 保持 → 折叠30° → 保持 → 复位，每段 3s
+    // 目标用限速斜坡而不是瞬间阶跃: 30° 一步跳变会让无阻尼的大惯量手臂冲过头(实测过冲 60%)。
+    // 限速后加速度小, 过冲几乎消失, 而且不依赖 D 项(不会放大编码器噪声)。
+    static uint32_t phase_start_ms = 0U;
+    static uint8_t phase = 0U;
+    static float fold_ref = 0.0f;  // 限速后的目标角(度)
+    constexpr uint32_t k_phase_ms = 3000U;
+    constexpr float k_fold_angle = 30.0f;
+    constexpr float k_fold_slew_deg_per_s = 40.0f;  // 折叠速度上限, 30° 约 0.75s 走完
+    constexpr float k_control_dt = 0.01f;           // 本函数调用周期
+
+    if (now_ms - phase_start_ms >= k_phase_ms) {
+      phase_start_ms = now_ms;
+      phase = static_cast<uint8_t>((phase + 1U) % 4U);
+    }
+    const bool folded = (phase == 1U) || (phase == 2U);
+    const float goal = folded ? k_fold_angle : 0.0f;
+    const float max_step = k_fold_slew_deg_per_s * k_control_dt;
+    if (fold_ref < goal - max_step) {
+      fold_ref += max_step;
+    }
+    else if (fold_ref > goal + max_step) {
+      fold_ref -= max_step;
+    }
+    else {
+      fold_ref = goal;
+    }
+
+    motor_angle(MOTOR_A, 0.0f);
+    motor_angle(MOTOR_B, fold_ref);
+    motor_enable(true);
+  }
+
+  // ── 调参用：15° 阶跃往复测试（每 4 s 在 0 与 +15° 之间切换）
+  // static uint32_t last_toggle_ms = 0U;
+  // static bool at_zero = true;
+  // if (now_ms - last_toggle_ms >= 4000U) {
+  //   last_toggle_ms = now_ms;
+  //   at_zero = !at_zero;
+  // }
+  // motor_angle(MOTOR_A, at_zero ? 0.0f : 15.0f);
+  // motor_enable(true);
+
   // ── 示例 1：motor_a 从使能位置转 +90° 并保持
-  //   motor_angle(MOTOR_A, 90.0f);
+  //   motor_angle(MOTOR_A, 30.0f);
   //   motor_enable(true);
 
   // ── 示例 2：什么都不给 = 三个轴都保持使能时的姿势（motor_angle 默认 0）
@@ -220,15 +355,14 @@ extern "C" void motor_control_update(void)
   //   motor_b(折叠)默认保持使能位置，要折叠就再加一行 motor_angle(MOTOR_B, deg)。
 
   // ── 示例 5：自动往复测试（不用遥控器）——每 2 s 在 0 与 +90° 之间切换
-  //   static uint32_t last_toggle_ms = 0U;
-  //   static bool at_zero = true;
-  //   const uint32_t now_ms = static_cast<uint32_t>(osKernelSysTick());
-  //   if (now_ms - last_toggle_ms >= 2000U) {
-  //     last_toggle_ms = now_ms;
-  //     at_zero = !at_zero;
-  //     motor_angle(MOTOR_A, at_zero ? 0.0f : 90.0f);
-  //   }
-  //   motor_enable(true);
+    //motor_enable(true);
+   //  static uint32_t last_toggle_ms = 0U;
+   //  static bool at_zero = true;
+   // if (now_ms - last_toggle_ms >= 2000U) {
+   //    last_toggle_ms = now_ms;
+    //   at_zero = !at_zero;
+   //    motor_angle(MOTOR_A, at_zero ? 0.0f : 90.0f);
+   //  }
 
   // ── 示例 6：角度正弦扫频（调角度环 PID 用）——目标角在 ±45° 间按 0.25 Hz 摆动
   //   （需要 #include <cmath>）

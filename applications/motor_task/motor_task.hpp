@@ -11,7 +11,7 @@ extern "C" {
 // ============================================================================
 // 电机任务对外接口
 // ----------------------------------------------------------------------------
-// 硬件：motor_a/b 为 GM6020（ID 1/2，电流控制帧 0x1FE），
+// 硬件：motor_a/b 为 GM6020（控制帧 0x1FE，a=ID2 底座、b=ID1 折叠），
 //       motor_c 为 C610 驱动的 M2006（ID 3，控制帧 0x200）。
 // 角色：a = yaw，b = 折叠，c = pitch（与 sp::Gimbal 无关，折叠轴单独保持）。
 // 单位：角度 rad、转速 rad/s、转矩 N·m、温度 ℃，均为输出轴侧；
@@ -85,8 +85,38 @@ extern volatile bool g_motor_a_online;
 extern volatile bool g_motor_b_online;
 extern volatile bool g_motor_c_online;
 
+// ─────────────────── 4.1 CAN1 接收诊断（只读） ───────────────────
+// 用于确认反馈帧是否真的到达、其 ID 是多少。
+//   g_can1_rx_frames  : 收到标准帧总数（递增即说明 CAN 接收正常）
+//   g_can1_last_rx_id : 最近一帧的 ID
+//   g_can1_a_frames   : 匹配 motor_a.rx_id 的帧数（为 0 说明 ID 不匹配）
+extern volatile uint32_t g_can1_rx_frames;
+extern volatile uint32_t g_can1_last_rx_id;
+extern volatile uint32_t g_can1_a_frames;
+extern volatile uint32_t g_can1_b_frames;
+// CAN ID 扫描表（见 motor_task.cpp 说明），slot=0 表示空槽。
+extern volatile uint32_t g_can1_id_slot[4];
+extern volatile uint32_t g_can1_id_count[4];
+
+// ─────────────────────── 4.2 折叠轴重力前馈（读写） ───────────────────────
+// 折叠轴在竖直平面内摆动, 重力矩随角度变化: τ(θ) = m·g·r·cos(θ - θ0)。
+// 用等价形式 τ(θ) = P·cosθ + Q·sinθ（θ 为编码器绝对角 rad）:
+//   P = A·cosθ0, Q = A·sinθ0, A = m·g·r 为力臂水平时的最大重力矩。
+// 写成 P/Q 的好处是可以由若干组 (角度, 所需力矩) 数据直接线性最小二乘拟合。
+// 前馈叠加在 PID 输出之外, 因此 PID 只需要处理残差(摩擦、动态误差)。
+extern volatile float g_fold_ff_p;  // cos 分量(N·m)
+extern volatile float g_fold_ff_q;  // sin 分量(N·m)
+// 标定结果(只读, 供观察/抄写):
+extern volatile float g_fold_cal_amp;    // 拟合出的 A(N·m)
+extern volatile float g_fold_cal_phase;  // 拟合出的 θ0(rad)
+extern volatile uint32_t g_fold_cal_state;  // 0 空闲 / 1 采集中 / 2 已完成
+extern volatile float g_motor_b_pid_out;    // 不含前馈的 PID 输出(N·m)
+
 // ─────────────────────── 5. 任务入口 ───────────────────────
 void motor_task(void const * argument);
+
+// 反馈帧统一入口：CAN1(中断) 与 CAN2(轮询) 都从这里进来。
+extern "C" void motor_process_can_frame(uint32_t id, const uint8_t * data, bool extended);
 
 #ifdef __cplusplus
 }

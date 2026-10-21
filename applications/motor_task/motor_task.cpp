@@ -1,5 +1,6 @@
 #include "cmsis_os.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -13,6 +14,24 @@
 #include "trajectory_task/trajectory_task.hpp"
 
 // ============================================================================
+// CAN1 接收诊断量（只读，供 plotter 观察）
+// ----------------------------------------------------------------------------
+// 用来确认"反馈到底有没有进来、进来的 ID 是多少"：
+//   g_can1_rx_frames  : 收到的标准帧总数（单调递增）
+//   g_can1_last_rx_id : 最近一帧的 ID
+//   g_can1_a_frames   : 与 motor_a.rx_id 匹配上的帧数
+// 三个量一起看就能区分"没有反馈"和"反馈 ID 不匹配"。
+// ============================================================================
+volatile std::uint32_t g_can1_rx_frames = 0;
+volatile std::uint32_t g_can1_last_rx_id = 0;
+volatile std::uint32_t g_can1_a_frames = 0;
+volatile std::uint32_t g_can1_b_frames = 0;
+// CAN ID 扫描表：记录总线上出现过的不同反馈 ID 及其帧数（最多 4 个槽位）。
+// slot 为 0 表示空槽；用来确认每个电机实际的反馈报文 ID 是多少。
+volatile std::uint32_t g_can1_id_slot[4] = {0U, 0U, 0U, 0U};
+volatile std::uint32_t g_can1_id_count[4] = {0U, 0U, 0U, 0U};
+
+// ============================================================================
 // 电机任务
 // ----------------------------------------------------------------------------
 // 职责：唯一直接操作 CAN 与 PID 的模块。
@@ -24,117 +43,225 @@
 // ============================================================================
 namespace
 {
-// ─────────────────────────── 1. 电机对象 ───────────────────────────
-// 角色：a(ID1)=yaw，b(ID2)=折叠，c(ID3)=pitch。
-// a/b 为 GM6020（直驱、绝对编码器），c 为 C610 驱动的 M2006。
-sp::RM_Motor motor_a(1, sp::RM_Motors::GM6020);
-sp::RM_Motor motor_b(2, sp::RM_Motors::GM6020);
-// M2006 带 36:1 减速箱，传入减速比后角度、转速、指令均为输出轴侧单位。
-sp::RM_Motor motor_c(3, sp::RM_Motors::M2006, sp::M2006_P36);
+  // ─────────────────────────── 1. 电机对象 ───────────────────────────
+  // 角色（已用"只让 b 动 20°"实测确认）：a(ID2)=底座 yaw，b(ID1)=折叠，c(ID3)=pitch。
+  // a/b 为 GM6020（直驱、绝对编码器，共用控制帧 0x1FE 的槽 1/槽 0），
+  // c 为 C610 驱动的 M2006（控制帧 0x200）。
+  sp::RM_Motor motor_a(2, sp::RM_Motors::GM6020);
+  sp::RM_Motor motor_b(1, sp::RM_Motors::GM6020);
+  // M2006 带 36:1 减速箱，传入减速比后角度、转速、指令均为输出轴侧单位。
+  sp::RM_Motor motor_c(3, sp::RM_Motors::M2006, sp::M2006_P36);
 
-// ─────────────────────── 2. 反馈解析（CAN 回调） ───────────────────────
-// 按反馈帧 ID 更新对应电机状态；RM 电机反馈使用标准帧。
-void process_motor_feedback(std::uint32_t id, const std::uint8_t * data, bool extended)
-{
-  if (extended) return;
+  // ─────────────────────── 2. 反馈解析（CAN 回调） ───────────────────────
+  // 按反馈帧 ID 更新对应电机状态；RM 电机反馈使用标准帧。
+  // 同时统计实际收到的 CAN ID，用于确认 GM6020 反馈报文 ID 是否与 rm_motor 的假设一致。
+  void process_motor_feedback(std::uint32_t id, const std::uint8_t *data, bool extended)
+  {
+    if (extended)
+      return;
 
-  const std::uint32_t stamp_ms = static_cast<std::uint32_t>(osKernelSysTick());
-  if (id == motor_a.rx_id) motor_a.read(data, stamp_ms);
-  if (id == motor_b.rx_id) motor_b.read(data, stamp_ms);
-  if (id == motor_c.rx_id) motor_c.read(data, stamp_ms);
-}
+    ++g_can1_rx_frames;
+    g_can1_last_rx_id = id;
 
-// ─────────────────────────── 3. 环路参数 ───────────────────────────
-// 角度环：角度误差经 PID 直接换算成转矩，单环控制，没有速度内环。
-// 输出量纲为 N·m，限幅即该电机的转矩上限。
-constexpr float k_pid_dt = 1e-3f;           // 控制周期 1ms, 与任务周期一致
-constexpr float k_d_filter_alpha = 0.3f;    // D 项一阶低通, 抑制转速噪声
+    // 扫描表：新 ID 占一个空槽，已知 ID 累加计数（中断上下文，只做简单线性查找）
+    for (int i = 0; i < 4; ++i)
+    {
+      if (g_can1_id_slot[i] == id)
+      {
+        ++g_can1_id_count[i];
+        break;
+      }
+      if (g_can1_id_slot[i] == 0U)
+      {
+        g_can1_id_slot[i] = id;
+        ++g_can1_id_count[i];
+        break;
+      }
+    }
 
-// ---- 3.1 yaw(a) / pitch(c) 角度环 ----
-constexpr float k_max_torque = 0.7f;        // GM6020 转矩上限(参考值): 约 0.135A
-constexpr float k_max_torque_m2006 = 0.5f;  // C610+M2006 转矩上限: 峰值 10A≈1.8N·m
-// 增益由原双环等效换算: 外环 kp=6.0/ki=2.0 乘以内环 kp=0.3 -> kp=1.8/ki=0.6;
-// 原内环对转速的比例作用(0.3N·m 每 rad/s)等效为本环的微分项 kd=0.3。
-// 单位: kp 为 N·m/rad, ki 为 N·m/(rad·s), kd 为 N·m/(rad/s)。
-constexpr float k_angle_kp = 1.8f;          // 角度误差 0.1rad -> 0.18N·m
-constexpr float k_angle_ki = 0.6f;          // 消除角度静差, 顶住摩擦与重力
-constexpr float k_angle_kd = 0.30f;         // 转速阻尼, 抑制过冲
-constexpr float k_angle_max_iout = 0.15f;   // 积分上限(N·m), 等效原内环 0.5rad/s 的输出
-
-// ---- 3.2 折叠轴(b)角度环 ----
-// 默认目标是"上电锁位"：首次收到有效反馈时把当时的角度写进 g_motor_b_angle_set，
-// 之后一直按该目标闭环，靠积分项顶住重力矩，云台不会因为没出力而倒下。
-// 控制层可以用 motor_angle(MOTOR_B, deg) 改写这个目标，驱动折叠/展开来躲避上方障碍。
-// 需要比 yaw/pitch 更大的力矩和积分上限，否则大负载时会被重力慢慢压下去。
-constexpr float k_fold_kp = 3.0f;           // N·m/rad
-constexpr float k_fold_ki = 2.0f;           // N·m/(rad·s)
-constexpr float k_fold_kd = 0.30f;          // N·m/(rad/s)
-constexpr float k_fold_max_torque = 1.2f;   // GM6020 额定约 2.2N·m, 取一半足够顶住且留余量
-constexpr float k_fold_max_iout = 1.2f;     // 积分上限取满, 否则重力矩大时压不住
-// 积分分离阈值(N·m): P 项超过它时暂停积分。
-// 折叠是大角度阶跃, 不限住积分会在到位前攒满, 到目标后表现为过冲和来回摆。
-constexpr float k_fold_integral_pause = 0.4f;
-
-// ---- 3.3 轨迹跟随的方向 ----
-// 电机输出正转矩就使该角度读数增大则为 +1.0f，否则 -1.0f。
-// 实测发现某个轴越纠越偏（正反馈发散）时，把对应符号取反。
-constexpr float k_imu_dir_yaw = 1.0f;
-constexpr float k_imu_dir_pitch = 1.0f;
-
-// ─────────────────────────── 4. PID 对象 ───────────────────────────
-sp::PID motor_a_angle_pid(
-  k_pid_dt, k_angle_kp, k_angle_ki, k_angle_kd, k_max_torque, k_angle_max_iout, k_d_filter_alpha);
-sp::PID motor_c_angle_pid(
-  k_pid_dt, k_angle_kp, k_angle_ki, k_angle_kd, k_max_torque_m2006, k_angle_max_iout,
-  k_d_filter_alpha);
-sp::PID motor_b_angle_pid(
-  k_pid_dt, k_fold_kp, k_fold_ki, k_fold_kd, k_fold_max_torque, k_fold_max_iout, k_d_filter_alpha);
-
-// ─────────────────────── 5. 使能零点 ───────────────────────
-// 每次使能后，各轴以"第一次拿到有效反馈时的角度"为原点，之后所有目标都相对它计算。
-// 因此 g_motor_*_angle_set 默认 0 就表示原地保持，电机使能后不会乱动。
-// 关使能时清零，下次使能重新取零点。
-struct AxisZero
-{
-  float offset = 0.0f;
-  bool latched = false;
-};
-
-// 反馈有效时锁存零点，每个使能周期只锁一次。
-void latch_zero(AxisZero & zero, const sp::RM_Motor & motor, uint32_t now_ms)
-{
-  if (zero.latched || !motor.is_alive(now_ms)) return;
-  zero.offset = motor.angle;
-  zero.latched = true;
-}
-
-AxisZero zero_a;
-AxisZero zero_b;
-AxisZero zero_c;
-
-// ───────────────────────── 6. 单个电机的环路 ─────────────────────────
-// 角度误差直接出转矩; 反馈超时则复位并停止输出。
-// sign 用于对齐"正转矩使反馈角增大"的方向, 不一致时取 -1.0f。
-// integral_pause > 0 时启用积分分离（P 项超过该值就暂停积分），用于大角度阶跃的折叠轴。
-void run_motor_loop(
-  sp::RM_Motor & motor, sp::PID & angle_pid, float angle_set, float angle_fdb, float sign,
-  float integral_pause, volatile float & cmd, uint32_t now_ms)
-{
-  if (!motor.is_alive(now_ms)) {
-    angle_pid.clear();
-    cmd = 0.0f;
-    return;
+    const std::uint32_t stamp_ms = static_cast<std::uint32_t>(osKernelSysTick());
+    if (id == motor_a.rx_id)
+    {
+      ++g_can1_a_frames;
+      motor_a.read(data, stamp_ms);
+    }
+    if (id == motor_b.rx_id)
+    {
+      ++g_can1_b_frames;
+      motor_b.read(data, stamp_ms);
+    }
+    if (id == motor_c.rx_id)
+      motor_c.read(data, stamp_ms);
   }
 
-  if (integral_pause > 0.0f) {
-    angle_pid.calc(angle_set, angle_fdb, integral_pause);
+  // ─────────────────────────── 3. 环路参数 ───────────────────────────
+  // 角度环：角度误差经 PID 直接换算成转矩，单环控制，没有速度内环。
+  // 输出量纲为 N·m，限幅即该电机的转矩上限。
+  constexpr float k_pid_dt = 1e-3f;        // 控制周期 1ms, 与任务周期一致
+  constexpr float k_d_filter_alpha = 0.3f; // D 项一阶低通, 抑制转速噪声
+
+  // ---- 3.1 yaw(a) / pitch(c) 角度环 ----
+  // 换算关系(由 sp::RM_Motor 内部完成, 这里只用于估算参数):
+  //   GM6020      : ±16384 对应 ±3A, 力矩常数 0.741N·m/A, 1N·m → 7370 计数, 上限 2.22N·m
+  //   C610+M2006  : ±10000 对应 ±10A, 36:1 减速, 输出侧上限约 1.8N·m
+  // 所以 kp 的物理含义很直接: 1° 误差出力 = kp * 0.01745 N·m。
+  constexpr float k_max_torque = 2.0f;        // GM6020 硬件上限 2.22N·m(3A), 留余量取 2.0(≈2.7A)
+  constexpr float k_max_torque_m2006 = 1.2f;  // M2006 上限约 1.8N·m, 取 66%
+  //
+  // 【调参记录】
+  //   第 1 步(纯 P): kp=1→振荡3次/静差13°(0.23N·m 摩擦); kp=2→6次/静差7°;
+  //                  kp=4→过冲约200%、4~5次慢衰减 => 实用临界 Ku≈4, Tu≈0.25s
+  //   第 2 步(D): PID 内部 kd 会放大角度量化噪声(1LSB/ms≈0.77rad/s), 加 kd 反而更抖;
+  //               速度阻尼(damp)方向异常, 会发散 => 两者均置 0, 不用 D。
+  //   第 3 步(I): 见下方 k_angle_ki 处说明。
+  // 单位: kp 为 N·m/rad, ki 为 N·m/(rad·s), kd 为 N·m/(rad/s)。
+  // 【当前调参阶段：第 3 步 — 加 I 消静差】
+  //   实测: kp=2 + 纯 P 时阶跃有小过冲、1~2 次摆动后稳定, 但稳态留一点静差。
+  //   I 的作用: 累积"误差×时间", 直到输出足够大顶住摩擦(实测约 0.2~0.3N·m)。
+  //     积分速度 ≈ ki × 静差: ki=2、静差 5°(0.087rad) → 每秒补 0.17N·m, 约 1.5s 消完。
+  //     max_iout 必须 ≥ 摩擦, 否则顶不住、静差消不掉; 取 0.5 留余量。
+  //   加 I 后可能出现"慢周期来回蹭"(积分过冲), 对策是降 ki(2→1→0.5), 不要动 kp。
+  constexpr float k_angle_kp = 2.0f;        // 已定, 不再改
+  constexpr float k_angle_ki = 0.01f;        // 消静差: 静差 5° 时约 1.5s 补足摩擦力矩
+  constexpr float k_angle_kd = 0.0f;        // 保持 0: 角度差分的 D 噪声太大
+  constexpr float k_angle_damp = 0.0f;      // 保持 0: 速度阻尼会发散(转速符号待确认)
+  constexpr float k_angle_max_iout = 0.5f;  // 积分上限要能覆盖摩擦(0.2~0.3N·m)
+
+  // ---- 3.2 折叠轴(b)角度环 ----
+  // 默认目标是"上电锁位"：首次收到有效反馈时把当时的角度写进 g_motor_b_angle_set，
+  // 之后一直按该目标闭环，靠积分项顶住重力矩，云台不会因为没出力而倒下。
+  // 控制层可以用 motor_angle(MOTOR_B, deg) 改写这个目标，驱动折叠/展开来躲避上方障碍。
+  // 需要比 yaw/pitch 更大的力矩和积分上限，否则大负载时会被重力慢慢压下去。
+  constexpr float k_fold_kp = 1.0f;          // N·m/rad
+  constexpr float k_fold_ki = 0.05f;          // N·m/(rad·s)
+  // kd 置 0: 与 yaw 轴同一个问题 —— PID 的 D 项靠 1kHz 角度差分, 1 个编码器 LSB/ms
+  // 就相当于 0.77rad/s, kd 会把量化噪声放大成转矩脉冲, 保持工况下表现为高频抖动。
+  constexpr float k_fold_kd = 0.0f;
+  constexpr float k_fold_max_torque = 2.0f;  // 顶重力用: GM6020 上限 2.22N·m, 取 2.0(≈2.7A)
+  constexpr float k_fold_max_iout = 1.5f;    // 积分上限: 静差需要它长期顶住重力矩
+  // 注意: 2.22N·m 是硬上限。5kg 负载若力臂 > 4.5cm(τ=mg·r), 重力矩就超过 2.2N·m,
+  //       任何 PID 都顶不住, 只能靠机械配平(弹簧/配重)或换电机。
+  // 积分分离阈值(N·m): P 项超过它时暂停积分, 用于大角度阶跃("折叠/展开")避免超调。
+  //   折叠/展开动作: 取 0.2 —— 有了重力前馈后, 稳态力矩由前馈承担, 积分只需补摩擦;
+  //                  阈值取小一些可避免动作过程中积分悄悄攒满造成过冲。
+  //   ⚠ 纯自锁(不动作、只顶住)时置 0, 否则下垂到一定角度后积分被冻住、误差消不掉。
+  constexpr float k_fold_integral_pause = 0.2f;
+
+  // ---- 3.3 轨迹跟随的方向 ----
+  // 电机输出正转矩就使该角度读数增大则为 +1.0f，否则 -1.0f。
+  // 实测发现某个轴越纠越偏（正反馈发散）时，把对应符号取反。
+  constexpr float k_imu_dir_yaw = 1.0f;
+  constexpr float k_imu_dir_pitch = 1.0f;
+
+  // ─────────────────────────── 4. PID 对象 ───────────────────────────
+  sp::PID motor_a_angle_pid(
+      k_pid_dt, k_angle_kp, k_angle_ki, k_angle_kd, k_max_torque, k_angle_max_iout, k_d_filter_alpha);
+  sp::PID motor_c_angle_pid(
+      k_pid_dt, k_angle_kp, k_angle_ki, k_angle_kd, k_max_torque_m2006, k_angle_max_iout,
+      k_d_filter_alpha);
+  sp::PID motor_b_angle_pid(
+      k_pid_dt, k_fold_kp, k_fold_ki, k_fold_kd, k_fold_max_torque, k_fold_max_iout, k_d_filter_alpha);
+
+  // ─────────────────────── 5. 使能零点 ───────────────────────
+  // 每次使能后，各轴以"第一次拿到有效反馈时的角度"为原点，之后所有目标都相对它计算。
+  // 因此 g_motor_*_angle_set 默认 0 就表示原地保持，电机使能后不会乱动。
+  // 关使能时清零，下次使能重新取零点。
+  struct AxisZero
+  {
+    float offset = 0.0f;
+    bool latched = false;
+  };
+
+  // 反馈有效时锁存零点，每个使能周期只锁一次。
+  void latch_zero(AxisZero &zero, const sp::RM_Motor &motor, uint32_t now_ms)
+  {
+    if (zero.latched || !motor.is_alive(now_ms))
+      return;
+    zero.offset = motor.angle;
+    zero.latched = true;
   }
-  else {
-    angle_pid.calc(angle_set, angle_fdb);
+
+  AxisZero zero_a;
+  AxisZero zero_b;
+  AxisZero zero_c;
+
+  // ─────────────────────── 6. 转速阻尼 ───────────────────────
+  // 为什么不用 PID 内部对角度做微分的 D 项:
+  //   1 kHz 下相邻两帧角度差 1 个编码器 LSB(0.044°) 就相当于 0.77 rad/s 的"转速"，
+  //   kd=0.3 时每个 LSB 会打出 0.23N·m 的转矩脉冲 —— 和摩擦(0.23N·m)同量级，
+  //   根本压不住振荡，反而喂出一个高频极限环(实测加 kd 后振荡更大)。
+  // 改用电机自己上报的转速(分辨率 1rpm≈0.105rad/s，比差分细 7 倍)做阻尼，
+  // 再做一阶低通，噪声只剩 kd×0.105 量级。
+  struct DampFilter
+  {
+    float speed = 0.0f;
+  };
+
+  constexpr float k_damp_alpha = 0.2f; // 转速低通系数, 越小越平滑
+
+  float damp_speed(DampFilter &filter, float speed)
+  {
+    filter.speed = k_damp_alpha * speed + (1.0f - k_damp_alpha) * filter.speed;
+    return filter.speed;
   }
-  cmd = sign * angle_pid.out;
+
+  DampFilter damp_a;
+  DampFilter damp_b;
+  DampFilter damp_c;
+
+  // ─────────────────── 7. 控制帧下发（CAN1 + CAN2） ───────────────────
+  // 电机可能挂在 CAN1(PD0/PD1) 或 CAN2(PB12/PB13) 上，同一帧同时发到两路：
+  // 挂在哪条总线上的电机都能收到，另一条总线多一帧没有副作用。
+  void send_frame(std::uint32_t id)
+  {
+    sp::can1.send(id);
+
+    static CAN_TxHeaderTypeDef header;
+    static std::uint32_t mailbox;
+    header.RTR = CAN_RTR_DATA;
+    header.DLC = sp::CAN_DATA_LEN;
+    header.IDE = CAN_ID_STD;
+    header.StdId = id;
+    HAL_CAN_AddTxMessage(&hcan2, &header, sp::can1.tx_data, &mailbox);  // 返回值故意忽略
+  }
+
+  // ───────────────────────── 8. 单个电机的环路 ─────────────────────────
+  // 角度误差直接出转矩; 反馈超时则复位并停止输出。
+  // sign 用于对齐"正转矩使反馈角增大"的方向, 不一致时取 -1.0f。
+  // integral_pause > 0 时启用积分分离（P 项超过该值就暂停积分），用于大角度阶跃的折叠轴。
+  // damp_gain 为转速阻尼系数(N·m 每 rad/s), 0 表示只用 PID 内部的 D 项。
+  void run_motor_loop(
+      sp::RM_Motor &motor, sp::PID &angle_pid, float angle_set, float angle_fdb, float sign,
+      float integral_pause, float damp_gain, DampFilter &damp, volatile float &cmd,
+      uint32_t now_ms)
+  {
+    if (!motor.is_alive(now_ms))
+    {
+      angle_pid.clear();
+      damp.speed = 0.0f;
+      cmd = 0.0f;
+      return;
+    }
+
+    if (integral_pause > 0.0f)
+    {
+      angle_pid.calc(angle_set, angle_fdb, integral_pause);
+    }
+    else
+    {
+      angle_pid.calc(angle_set, angle_fdb);
+    }
+
+    // 阻尼作用在电机自身坐标系里(与 sign / 传感器坐标系无关), 永远与转动方向相反。
+    cmd = sign * angle_pid.out - damp_gain * damp_speed(damp, motor.speed);
+  }
+} // namespace
+
+// CAN1(中断回调) 与 CAN2(轮询) 共用的反馈入口：两路总线的帧都进同一套解析。
+extern "C" void motor_process_can_frame(std::uint32_t id, const std::uint8_t *data, bool extended)
+{
+  process_motor_feedback(id, data, extended);
 }
-}  // namespace
 
 // ============================================================================
 // 对外状态与指令：其他模块只通过下面这些全局量与电机打交道。
@@ -191,6 +318,19 @@ volatile bool g_motor_a_online = false;
 volatile bool g_motor_b_online = false;
 volatile bool g_motor_c_online = false;
 
+// ─────────────────── 4.1 折叠轴重力前馈 ───────────────────
+// 前馈系数: τ_ff(θ) = g_fold_ff_p·cosθ + g_fold_ff_q·sinθ，θ = motor_b.angle。
+// 由实测标定得到(见 motor_control.cpp 的标定流程)：
+//   A = m·g·r = 0.345 N·m, θ0 = 8.4763° = 0.14794 rad
+//   P = A·cosθ0 = 0.3412,  Q = A·sinθ0 = 0.05085
+// 负载变化后需要重新标定：把 k_fold_cal_enable 置 true 跑一次，再抄回这两个值。
+volatile float g_fold_ff_p = 0.3412f;
+volatile float g_fold_ff_q = 0.05085f;
+volatile float g_fold_cal_amp = 0.345f;
+volatile float g_fold_cal_phase = 0.14794f;
+volatile uint32_t g_fold_cal_state = 0U;
+volatile float g_motor_b_pid_out = 0.0f;
+
 // ─────────────────────────── 4. 轨迹快照 ───────────────────────────
 // 每周期由 trajectory_read() 取一组自洽的轨迹值（内部有临界区保护），
 // 口径为 world(IMU) 系，单位 rad / rad/s / rad/s²。
@@ -202,7 +342,7 @@ TrajectoryPoint g_motor_traj_snapshot;
 //   ① 取轨迹快照 → ② 锁存使能零点 → ③ 跑角度环 → ④ 打包下发 → ⑤ 回写状态 → ⑥ 定周期
 // 顺序不能乱：④ 必须用到 ③ 刚算出的指令，⑤ 必须在 ④ 之后才能反映本轮下发的结果。
 // ============================================================================
-extern "C" void motor_task(void const * argument)
+extern "C" void motor_task(void const *argument)
 {
   (void)argument;
 
@@ -212,7 +352,8 @@ extern "C" void motor_task(void const * argument)
   bool pid_was_enabled = false;
   TickType_t wake_tick = xTaskGetTickCount();
 
-  while (true) {
+  while (true)
+  {
     const std::uint32_t now_ms = static_cast<std::uint32_t>(osKernelSysTick());
 
     // ---- ① 轨迹快照：仅供观察，不影响电机行为 ----
@@ -221,53 +362,68 @@ extern "C" void motor_task(void const * argument)
     // ---- ② 锁存使能零点 ----
     // 第一次拿到有效反馈时记录当时的编码器角度作为原点，之后目标都是相对它。
     // 编码器上电读数即为机械绝对角，因此无需额外的回零动作。
-    if (g_motor_pid_enable) {
+    if (g_motor_pid_enable)
+    {
       latch_zero(zero_a, motor_a, now_ms);
       latch_zero(zero_b, motor_b, now_ms);
       latch_zero(zero_c, motor_c, now_ms);
     }
 
     // ---- ③ 角度环：每 1 ms 计算一次，使能时接管指令 ----
-    if (g_motor_pid_enable) {
+    if (g_motor_pid_enable)
+    {
       const bool imu_ok =
-        static_cast<std::uint32_t>(now_ms - g_imu_update_ms) < IMU_STALE_TIMEOUT_MS;
+          static_cast<std::uint32_t>(now_ms - g_imu_update_ms) < IMU_STALE_TIMEOUT_MS;
 
-      if (g_gimbal_traj_enable) {
+      if (g_gimbal_traj_enable)
+      {
         // 轨迹跟随: 目标在世界系, 反馈取 IMU 姿态, 与编码器零点无关。
         // IMU 数据过期时反馈会一直停在旧值, 误差不再变化, 环路会持续死推, 必须停止输出。
-        if (imu_ok) {
+        if (imu_ok)
+        {
           run_motor_loop(
-            motor_a, motor_a_angle_pid, g_gimbal_yaw_set, g_yaw_rad, k_imu_dir_yaw, 0.0f,
-            g_motor_a_cmd, now_ms);
+              motor_a, motor_a_angle_pid, g_gimbal_yaw_set, g_yaw_rad, k_imu_dir_yaw, 0.0f,
+              k_angle_damp, damp_a, g_motor_a_cmd, now_ms);
           run_motor_loop(
-            motor_c, motor_c_angle_pid, g_gimbal_pitch_set, g_pitch_rad, k_imu_dir_pitch, 0.0f,
-            g_motor_c_cmd, now_ms);
+              motor_c, motor_c_angle_pid, g_gimbal_pitch_set, g_pitch_rad, k_imu_dir_pitch, 0.0f,
+              k_angle_damp, damp_c, g_motor_c_cmd, now_ms);
         }
-        else {
+        else
+        {
           motor_a_angle_pid.clear();
           motor_c_angle_pid.clear();
           g_motor_a_cmd = 0.0f;
           g_motor_c_cmd = 0.0f;
         }
       }
-      else {
+      else
+      {
         // 角度模式: 目标相对使能零点, 默认 0 即保持不动。
         run_motor_loop(
-          motor_a, motor_a_angle_pid, zero_a.offset + g_motor_a_angle_set, motor_a.angle, 1.0f,
-          0.0f, g_motor_a_cmd, now_ms);
+            motor_a, motor_a_angle_pid, zero_a.offset + g_motor_a_angle_set, motor_a.angle, 1.0f,
+            0.0f, k_angle_damp, damp_a, g_motor_a_cmd, now_ms);
         run_motor_loop(
-          motor_c, motor_c_angle_pid, zero_c.offset + g_motor_c_angle_set, motor_c.angle, 1.0f,
-          0.0f, g_motor_c_cmd, now_ms);
+            motor_c, motor_c_angle_pid, zero_c.offset + g_motor_c_angle_set, motor_c.angle, 1.0f,
+            0.0f, k_angle_damp, damp_c, g_motor_c_cmd, now_ms);
       }
 
       // 折叠轴与上面两种模式无关: 始终以使能零点为目标把云台顶在原位, 不让它倒下。
       // 折叠是大角度阶跃, 用积分分离避免到位过冲。
       run_motor_loop(
-        motor_b, motor_b_angle_pid, zero_b.offset + g_motor_b_angle_set, motor_b.angle, 1.0f,
-        k_fold_integral_pause, g_motor_b_cmd, now_ms);
+          motor_b, motor_b_angle_pid, zero_b.offset + g_motor_b_angle_set, motor_b.angle, 1.0f,
+          k_fold_integral_pause, 0.0f, damp_b, g_motor_b_cmd, now_ms);
+
+      // 重力前馈: PID 只需处理残差, 前馈承担随角度变化的重力矩 τ(θ)=P·cosθ+Q·sinθ。
+      // 电机离线时 run_motor_loop 已把指令清零, 此处不能再叠加前馈。
+      g_motor_b_pid_out = g_motor_b_cmd;
+      if (motor_b.is_alive(now_ms)) {
+        g_motor_b_cmd +=
+          g_fold_ff_p * std::cos(motor_b.angle) + g_fold_ff_q * std::sin(motor_b.angle);
+      }
       pid_was_enabled = true;
     }
-    else if (pid_was_enabled) {
+    else if (pid_was_enabled)
+    {
       // 关闭瞬间清零并复位 PID, 避免残留转矩; 同时丢弃零点, 下次使能重新取。
       g_motor_a_cmd = 0.0f;
       g_motor_b_cmd = 0.0f;
@@ -291,12 +447,12 @@ extern "C" void motor_task(void const * argument)
     std::memset(sp::can1.tx_data, 0, sizeof(sp::can1.tx_data));
     motor_a.write(sp::can1.tx_data);
     motor_b.write(sp::can1.tx_data);
-    sp::can1.send(motor_a.tx_id);
+    send_frame(motor_a.tx_id);
 
     // M2006 使用独立控制帧。
     std::memset(sp::can1.tx_data, 0, sizeof(sp::can1.tx_data));
     motor_c.write(sp::can1.tx_data);
-    sp::can1.send(motor_c.tx_id);
+    send_frame(motor_c.tx_id);
 
     // ---- ⑤ 回写状态：在线状态、角度、转速、转矩、温度 ----
     g_motor_a_online = motor_a.is_alive(now_ms);
