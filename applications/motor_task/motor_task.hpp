@@ -43,7 +43,6 @@ extern volatile bool g_motor_pid_enable;
 // 与 b 的区别：b 恒随总使能自锁，a/c 必须单独打开。
 extern volatile bool g_motor_a_loop_enable;
 extern volatile bool g_motor_c_loop_enable;
-
 // 轨迹跟随模式：1 时 a(yaw)/c(pitch) 以 IMU 的世界系姿态为反馈，
 // 跟踪下面的 g_gimbal_*_set；0 时 a/c 按 g_motor_*_angle_set 以编码器反馈（角度模式）。
 // 折叠轴 b 不受本开关影响，始终锁位保持。
@@ -69,6 +68,12 @@ extern volatile float g_motor_c_angle_set;
 extern volatile float g_motor_a_cmd;
 extern volatile float g_motor_b_cmd;
 extern volatile float g_motor_c_cmd;
+
+// 诊断用：把 c 轴的 PID 输出和前馈分量分开暴露，用于定位"指令值不符合预期"。
+// g_motor_c_pid_out 是 PID 自己的输出（已按 max_out 限幅），
+// g_pitch_ff_out 是叠加到指令上的前馈量（粘滞+库仑+惯性），两者之和≈g_motor_c_cmd。
+extern volatile float g_motor_c_pid_out;
+extern volatile float g_pitch_ff_out;
 
 // ─────────────────────── 4. 反馈状态 ───────────────────────
 // 角度 rad、转速 rad/s、转矩 N·m、温度 ℃、在线状态，均由 motor_task 刷新。

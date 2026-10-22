@@ -12,11 +12,11 @@
 //   而 680ms 周期的基频 1.47Hz, 只有约 2 倍余量 => 跟踪误差必然大。
 //   要把误差压到 0.5° 需 ωn 提高约 5 倍, 即 kp ≈ 50N·m/rad, 远超稳定性边界。
 //   => 680ms/±22.5° 这个工况下 yaw 的命中率存在物理上限, 靠调参无法达标。
-// ⚠ 调参临时状态: 只调 yaw, pitch 基本不摆动。
-//   PITCH_RANGE 取 0.02°(static_assert 要求 >0), 等效静止, 保持对齐后的位置不动。
-//   yaw 调完之后把 PITCH_RANGE 改回 60.0f。
-#define TRAJECTORY_YAW_RANGE_DEG 45.0f
-#define TRAJECTORY_PITCH_RANGE_DEG 0.02f
+// ⚠ 调参临时状态: 只调 pitch, yaw 基本不摆动。
+//   YAW_RANGE 取 0.02°(static_assert 要求 >0), 等效静止, 保持对齐后的位置不动。
+//   yaw 调完之后把 YAW_RANGE 改回 45.0f。
+#define TRAJECTORY_YAW_RANGE_DEG 0.02f
+#define TRAJECTORY_PITCH_RANGE_DEG 60.0f
 
 #define TRAJECTORY_SAMPLE_INTERVAL_MS 1U
 // 【周期按初始设计值 680ms】

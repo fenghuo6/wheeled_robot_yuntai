@@ -107,7 +107,11 @@ namespace
   //   C610+M2006  : ±10000 对应 ±10A, 36:1 减速, 输出侧上限约 1.8N·m
   // 所以 kp 的物理含义很直接: 1° 误差出力 = kp * 0.01745 N·m。
   constexpr float k_max_torque = 2.0f;        // GM6020 硬件上限 2.22N·m(3A), 留余量取 2.0(≈2.7A)
-  constexpr float k_max_torque_m2006 = 1.2f;  // M2006 上限约 1.8N·m, 取 66%
+  // M2006/C610 输出侧物理上限约 1.8N·m。这个值是 PID 的输出限幅, 直接决定纠偏权限:
+  //   680ms/±30° 下实测 PID 会顶到 1.2 的上限(−1.0~+1.2), 峰值误差达 +12.9°,
+  //   说明限幅卡住了纠偏能力 => 放开到电机的真实上限。
+  // 注意: 电机侧 cmd() 还会按 ±10000 raw(±1.8N·m) 再夹一次, 所以不会超过硬件。
+  constexpr float k_max_torque_m2006 = 1.8f;
   //
   // 【yaw 调参记录（按时间顺序，全部为 680ms/±22.5° 实测）】
   //
@@ -231,12 +235,22 @@ namespace
   //   用 0.10 是理论值的 12 倍, 过补偿必然劣化。
   // 现在 kp=5、实测 τ = e/ω = 1.3°/410°/s ≈ 3.2ms => 理论 k_v ≈ 0.016, 取 0.02 微调。
   constexpr float k_yaw_ff_viscous = 0.0f;     // 归零
-  constexpr float k_pitch_ff_coulomb = 0.15f;  // N·m, 静摩擦实测 0.09~0.2, RMS 实测 0.60 为最优
-  // pitch 粘滞项实测曲线: 0.05→12°, 0.10→7~8°, 0.15→3°, 0.20→1.9~3.4°(均值≈2.6), 0.25→12°
-  //   前四项单调改善说明这是真实需要的速度阻尼补偿(减速箱+轴承的粘滞阻力), 不是过补偿;
-  //   0.25 的断崖来自饱和: 0.25×8.3rad/s = 2.08N·m, 超过 M2006 的 1.8N·m 物理上限,
-  //   补过头 → 反向冲击 → 振荡。而 0.20×8.3 = 1.66N·m 刚好在上限内。
-  //   => 0.20 是这条轴的实际上限, 定稿。
+  constexpr float k_pitch_ff_coulomb = 0.15f;  // N·m, 静摩擦实测 0.09~0.2
+  // 【重要】粘滞系数 0.20 在 680ms/±30° 下是必需的, 不是过量:
+  //   实测 0.02 → RMS 15°; 0.20 → RMS 3.3°。
+  //   原因是 M2006 在 476°/s(输出) = 2850rpm(电机) 下转矩已大幅衰减,
+  //   这条轴在该速度下确实需要约 1.7N·m 才推得动, 前馈承担了绝大部分。
+  //   （早先"0.20 是低速拟合外推、高速失控"的判断是错的: 把通道 17/18 的
+  //     "各自取值范围"误当成了同时刻数值, 得出"前馈与 PID 互相抵消"的错误结论。）
+  // ⚠ 0.25 会造成断崖式恶化(0.25×8.31=2.08N·m 超过电机 1.8N·m 物理上限)，不要再往上加。
+  // 【"下方峰值拟合差、其余都好"的原因: 力竭】
+  //   轨迹上下段速度很不对称: 上升 283.8°/s(4.95rad/s)、下降 476.0°/s(8.31rad/s)。
+  //   前馈 = viscous×vel + coulomb:
+  //     上升段 0.20×4.95 + 0.15 = 1.14N·m → 剩 0.66 给 PID ✅
+  //     下降段 0.20×8.31 + 0.15 = 1.81N·m → 超过电机 1.8N·m 上限, PID 权限几乎为 0 ❌
+  //   下降段是全程唯一力竭的工况, 所以只有那一个峰值拟合不好。
+  // 取 0.17 试过比 0.20 更差(上升段补偿不足), 动态"前馈让位"也试过更差。
+  // 结论: 0.20 是实测最优, 保持固定值, 不要再加限幅/让位逻辑。
   constexpr float k_pitch_ff_viscous = 0.20f;  // N·m/(rad/s)
 
   // ---- 3.2 折叠轴(b)角度环 ----
@@ -371,6 +385,9 @@ namespace
 volatile float g_motor_a_cmd = 0.0f;
 volatile float g_motor_b_cmd = 0.0f;
 volatile float g_motor_c_cmd = 0.0f;
+// 诊断用（见 motor_task.hpp）
+volatile float g_motor_c_pid_out = 0.0f;
+volatile float g_pitch_ff_out = 0.0f;
 // 折叠轴(b)角度环使能：置 1 后 b 自锁保持目标角；初值 0，上电不输出转矩。
 volatile bool g_motor_pid_enable = false;
 // a(yaw)/c(pitch) 角度环使能：默认 0 = 不输出转矩、可自由转动；
@@ -528,10 +545,14 @@ extern "C" void motor_task(void const *argument)
           run_motor_loop(
               motor_c, motor_c_angle_pid, g_gimbal_pitch_set, g_pitch_rad, k_imu_dir_pitch, 0.0f,
               k_pitch_damp, damp_c, g_motor_c_cmd, now_ms);
+          // 诊断: 记下 PID 自身输出(前馈叠加之前)
+          g_motor_c_pid_out = g_motor_c_cmd;
+          g_pitch_ff_out = 0.0f;
           if (g_traj_following && motor_c.is_alive(now_ms)) {
             const float ff = k_pitch_inertia * pitch_acc +
                              friction_ff(pitch_vel, k_pitch_ff_coulomb, k_pitch_ff_viscous);
-            g_motor_c_cmd += k_imu_dir_pitch * ff;
+            g_pitch_ff_out = k_imu_dir_pitch * ff;
+            g_motor_c_cmd += g_pitch_ff_out;
           }
         }
         else
