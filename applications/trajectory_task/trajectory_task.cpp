@@ -759,6 +759,8 @@ volatile float pitch_vel = kInitialPoint.pitch_vel;
 volatile float pitch_acc = kInitialPoint.pitch_acc;
 // 上电默认停在起点，等控制层确认云台已对齐后再放行。
 volatile uint8_t g_trajectory_running = 0U;
+// 当前轨迹相位(ms)，供 ILC 用；在 publish 之后由任务循环更新。
+volatile uint32_t g_trajectory_phase_ms = 0U;
 }
 
 extern "C" TrajectoryPoint trajectory_sample_at_ms(uint32_t elapsed_ms)
@@ -817,11 +819,13 @@ extern "C" void trajectory_task(void const * argument)
       taskENTER_CRITICAL();
       s_phase_ms = (s_phase_ms + delta_ticks % TRAJECTORY_PERIOD_MS) % TRAJECTORY_PERIOD_MS;
       const uint32_t phase_ms = s_phase_ms;
+      g_trajectory_phase_ms = phase_ms;
       taskEXIT_CRITICAL();
       publish(trajectory_sample_at_ms(phase_ms));
     }
     else {
       // 未放行：持续发布起点值，控制层据此把云台对齐到轨迹开始位置。
+      g_trajectory_phase_ms = 0U;
       publish(kInitialPoint);
     }
 

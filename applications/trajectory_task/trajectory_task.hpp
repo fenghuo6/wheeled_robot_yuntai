@@ -12,11 +12,13 @@
 //   而 680ms 周期的基频 1.47Hz, 只有约 2 倍余量 => 跟踪误差必然大。
 //   要把误差压到 0.5° 需 ωn 提高约 5 倍, 即 kp ≈ 50N·m/rad, 远超稳定性边界。
 //   => 680ms/±22.5° 这个工况下 yaw 的命中率存在物理上限, 靠调参无法达标。
-// ⚠ 调参临时状态: 只调 yaw, pitch 基本不摆动。
-//   YAW_RANGE = 45.0f(±22.5°) 正常摆; PITCH_RANGE 取 0.02°(static_assert 要求 >0) 等效静止。
-//   调完 yaw 之后把 PITCH_RANGE 改回 60.0f。
+//
+// 两个 RANGE 都是"全行程"，乘到轨迹表上：kScale = RANGE / 参考行程(45 / 60)。
+// 表本身已经是 yaw ±22.5°、pitch ±30°，所以取 45 与 60 时比例系数正好是 1。
+// ⚠ 只想单独调某一轴时，把另一轴的 RANGE 设成一个极小值（如 0.02f，static_assert 要求 >0）
+//   即可让它等效静止；注意改完要改回来，否则该轴的电机"不跟"——因为目标幅值接近 0。
 #define TRAJECTORY_YAW_RANGE_DEG 45.0f
-#define TRAJECTORY_PITCH_RANGE_DEG 0.02f
+#define TRAJECTORY_PITCH_RANGE_DEG 60.0f
 
 #define TRAJECTORY_SAMPLE_INTERVAL_MS 1U
 // 【周期按初始设计值 680ms】
@@ -48,6 +50,10 @@ extern volatile float pitch_acc;
 // 轨迹推进使能：0 时停在起点(t=0)并把起点值持续发布，1 时正常推进。
 // 上电默认 0，即轨迹先不跑；由控制层在对齐完成后调用 trajectory_start() 放行。
 extern volatile uint8_t g_trajectory_running;
+
+// 当前轨迹相位(ms)，范围 [0, TRAJECTORY_PERIOD_MS)。
+// 供 ILC(迭代学习) 用：把"哪个时刻差多少"记录下来，下一周期在同一相位补偿。
+extern volatile uint32_t g_trajectory_phase_ms;
 
 typedef struct
 {

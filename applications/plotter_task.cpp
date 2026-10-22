@@ -22,12 +22,15 @@ sp::Plotter plotter(&huart1, false);
 //   11 实际 yaw(°)(IMU) | 12 实际 pitch(°)(IMU)
 //   13 yaw 误差 RMS(°) | 14 pitch 误差 RMS(°)
 //   15 yaw 命中率(0~1,比赛计分) | 16 pitch 命中率(0~1,比赛计分)
-//   17 陀螺 Z 零偏(°/s) | 18 状态位图(bit0零偏 bit1 yaw就绪 bit2 pitch就绪 bit3跟随中)
-//      全满足=15; 对齐中=7; 若为 3/11 说明 pitch 轴不可用; 若为 5/13 说明 yaw 轴不可用
-//      （pitch 暂时静止, 原 17/18 的 pitch 诊断量暂不打印）
+//   17 yaw ILC 补偿力矩(N·m) | 18 状态位图
+//      17 恒为 0 → ILC 没跑起来; 缓慢增长 → 在学, 只是慢
+//      18 低 4 位: bit0零偏 bit1 a就绪 bit2 c就绪 bit3跟随中
+//         全满足=15; 对齐中=7; 为 3/11 说明 c 不可用; 为 5/13 说明 a 不可用
+//      18 高 4 位: 折叠阶段 0=停在0° 1=折叠中 2=停留中 3=复位中 4=复位完成
+//         所以 0x30 = 48 表示"复位完成且未跟随，无轴就绪"
 //
 // 实际角与目标角同基准（都相对本次使能时的零点），可直接相减得到误差。
-// a/c 是否出力由各自的开关决定（motor_axis_enable）；即使不出力，实际角照常随手动转动变化。
+// a/c 是否出力由 motor_control 的跟随/顶住/松手决策决定；即使不出力，实际角照常随手动转动变化。
 // 7/8 是 目标−实际 的误差，跟踪好时应该贴着 0；用它判断滞后和过冲最直接。
 // 9/10 是 trajectory_task 输出的轨迹本身（世界系角度），未加 yaw 平移偏置；
 //   电机实际在追的目标 = 该值 + g_yaw_offset。
@@ -105,7 +108,7 @@ extern "C" void plotter_task(void const *argument)
       g_motor_c_angle_rel * k_rad_to_deg, g_motor_a_cmd, g_motor_b_cmd, g_motor_c_cmd, yaw_err,
       pitch_err, traj.yaw * k_rad_to_deg, traj.pitch * k_rad_to_deg, g_yaw_rad * k_rad_to_deg,
       g_pitch_rad * k_rad_to_deg, yaw_rms, pitch_rms, g_yaw_fire_ratio, g_pitch_fire_ratio,
-      g_imu_bias_z * k_rad_to_deg, static_cast<float>(g_traj_status_bits));
+      g_yaw_ilc_out, static_cast<float>(g_traj_status_bits));
     osDelay(10);
   }
 }

@@ -39,6 +39,10 @@ extern volatile bool g_traj_following;
 // 全部满足 = 15。对齐中 = 7（前三项满足但还没放行）。
 extern volatile uint8_t g_traj_status_bits;
 
+// ILC 当前叠加到 yaw 的补偿力矩(N·m)，诊断"学习是否真的在生效"。
+// 恒为 0 → 学习没跑起来（相位/门控问题）；缓慢增长 → 只是学习率太小。
+extern volatile float g_yaw_ilc_out;
+
 // ─────────────────────── 1. 使能与模式 ───────────────────────
 // 折叠轴(b)角度环使能：1 时 b 自锁保持目标角（顶住云台重力），0 时全部停止输出；
 // 默认 0，上电不出力。
@@ -49,10 +53,14 @@ extern volatile bool g_motor_pid_enable;
 // 与 b 的区别：b 恒随总使能自锁，a/c 必须单独打开。
 extern volatile bool g_motor_a_loop_enable;
 extern volatile bool g_motor_c_loop_enable;
-// 轨迹跟随模式：1 时 a(yaw)/c(pitch) 以 IMU 的世界系姿态为反馈，
-// 跟踪下面的 g_gimbal_*_set；0 时 a/c 按 g_motor_*_angle_set 以编码器反馈（角度模式）。
-// 折叠轴 b 不受本开关影响，始终锁位保持。
-extern volatile bool g_gimbal_traj_enable;
+// 轨迹跟随模式，按轴独立：1 时该轴以 IMU 的世界系姿态为反馈，跟踪下面的 g_gimbal_*_set；
+// 0 时该轴按 g_motor_*_angle_set 以编码器反馈（角度模式，目标 0 即顶在使能位置）。
+// 【为什么必须按轴分开】原来只有一个总开关，打开后 a/c 会同时切到 IMU 反馈：
+//   motorA_track(true) 只想要 yaw 跟随，c 却会被带着一起追 g_gimbal_pitch_set。
+//   分开后两个轴可以一个跟随、一个原地顶住。
+// 折叠轴 b 不受本开关影响，始终用编码器反馈锁位。
+extern volatile bool g_gimbal_traj_a;
+extern volatile bool g_gimbal_traj_c;
 
 // ─────────────────────── 2. 目标值 ───────────────────────
 // 轨迹跟随的世界系目标角（rad），由 trajectory_task 的曲线给出。
