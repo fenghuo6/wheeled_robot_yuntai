@@ -132,7 +132,9 @@ namespace
 
   // 每 1 ms 推进一次启动流程。
   // imu_ok 为假（IMU 数据过期）时不推进对齐判定，目标维持当前读数使偏差为 0。
-  void trajectory_follow_update(bool imu_ok)
+  // yaw_ok / pitch_ok：该轴是否可用（反馈在线）。掉线的一轴不参与对齐判定，
+  //   否则一个轴掉线会让另一个轴永远进不了窗口、只能等超时。
+  void trajectory_follow_update(bool imu_ok, bool yaw_ok, bool pitch_ok)
   {
     // 一旦进入跟随模式就切到 IMU 反馈，避免退回编码器模式后目标变成 0 而抢动。
     g_gimbal_traj_enable = true;
@@ -161,9 +163,10 @@ namespace
         g_gimbal_yaw_set = g_align_yaw;
         g_gimbal_pitch_set = g_align_pitch;
 
-        const bool in_position = within(g_yaw_rad, point.yaw, k_align_tolerance) &&
-                                 within(g_pitch_rad, point.pitch, k_align_tolerance);
-        g_in_position_ms = in_position ? (g_in_position_ms + k_control_period_ms) : 0U;
+        // 只检查"在用"的轴，掉线轴不拖累另一个轴的对齐。
+        const bool yaw_in = !yaw_ok || within(g_yaw_rad, point.yaw, k_align_tolerance);
+        const bool pitch_in = !pitch_ok || within(g_pitch_rad, point.pitch, k_align_tolerance);
+        g_in_position_ms = (yaw_in && pitch_in) ? (g_in_position_ms + k_control_period_ms) : 0U;
         g_align_ms += k_control_period_ms;
       }
       if (g_in_position_ms >= k_align_hold_ms || g_align_ms >= k_align_timeout_ms) {
@@ -182,6 +185,8 @@ namespace
 
 // 轨迹是否处于正常跟随阶段（见 motor_task.hpp 说明）。
 volatile bool g_traj_following = false;
+// 启动条件与阶段位图（见 motor_task.hpp 说明）。
+volatile uint8_t g_traj_status_bits = 0U;
 
 // ============================================================================
 // 入口：由 motor_task 每 1 ms 调用一次
@@ -199,18 +204,9 @@ extern "C" void motor_control_update(void)
   const uint32_t now_ms = static_cast<uint32_t>(osKernelSysTick());
 
   // ---- ① 安全检查 ----
-  // 单轴掉线由 motor_task 内部处理：run_motor_loop() 发现该轴 is_alive() 为假就把它的
-  // 转矩指令清零，不影响其他轴。这里不能"任一轴掉线就整机停"，否则单电机台架测试
-  // （只接 motor_a）会因为没接的 motor_c 一直离线而永远不出力矩。
-  // 只有轨迹跟随必须 a/c 两轴都在线：目标在世界系，缺反馈时误差不再变化，环路会持续死推。
-  if (g_gimbal_traj_enable && (!g_motor_a_online || !g_motor_c_online)) {
-    // 反馈掉了(>100ms 无 CAN 帧)：只停 yaw/pitch 两个轴，折叠轴继续自锁，别让机械臂掉下来。
-    motor_axis_enable(MOTOR_A, false);
-    motor_axis_enable(MOTOR_C, false);
-    trajectory_follow_abort();  // 轨迹回到起点，下次重新对齐
-    return;
-  }
-
+  // 掉线处理完全交给 ③ 的分轴判定：各轴 is_alive() 为假就只松开那一轴。
+  // 这里不能"任一轴掉线就整机停"，否则单轴测试（只接 motor_a）会因为其他轴离线而永不出力，
+  // 也无法做到"A 掉线时 C 继续跟随"。
   if (g_motor_a_temperature > 80U || g_motor_b_temperature > 80U ||
       g_motor_c_temperature > 80U) {
     motor_enable(false);        // 过热保护
@@ -238,25 +234,30 @@ extern "C" void motor_control_update(void)
   //   kFollow→ 目标 = 轨迹当前点
   const bool imu_ok =
       static_cast<uint32_t>(now_ms - g_imu_update_ms) < IMU_STALE_TIMEOUT_MS;
-  // 三路反馈都在线才进世界系闭环：IMU + yaw(a) + pitch(c) + 折叠(b)。
-  // b 掉线时它不出力、折叠臂会缓慢下坠，而 IMU 装在下游，下坠会让"世界系姿态"自己转起来。
-  // 这时跑轨迹跟随毫无意义（目标冻结、误差单调增大、永远对不齐），所以 b 离线就整体不启动。
-  const bool traj_ready =
-      imu_ok && g_motor_b_online && g_motor_a_online && g_motor_c_online;
+  // 【分轴独立判定】A(yaw) 与 C(pitch) 互不依赖，一个掉线另一个照常工作。
+  // 公共前提：IMU 可用 + 零偏标定完成 + **折叠轴 b 在线**。
+  //   b 必须在线：它掉线时不出力、折叠臂会缓慢下坠，而 IMU 装在折叠关节下游，
+  //   下坠会让"世界系姿态"自己转起来 —— 此时 A/C 的世界系闭环都失去意义。
+  // 零偏标定必须在开始运动之前完成，否则永远采不到静止样本，
+  //   而且零偏会一直存在 → yaw 单向漂移 → 环路持续单方向驱动 → 线缆缠绕。
+  const bool base_ready = imu_ok && g_imu_bias_ready && g_motor_b_online;
+  const bool yaw_ok = base_ready && g_motor_a_online;
+  const bool pitch_ok = base_ready && g_motor_c_online;
 
-  if (traj_ready) {
-    motor_axis_enable(MOTOR_A, true);
-    motor_axis_enable(MOTOR_C, true);
-    trajectory_follow_update(true);   // 内部会置 g_gimbal_traj_enable = true
+  if (yaw_ok || pitch_ok) {
+    // 轨迹推进只要有一个轴可用就走；不可用的轴由 motor_axis_enable(false) 关闭。
+    trajectory_follow_update(true, yaw_ok, pitch_ok);
   }
   else {
-    // IMU 或电机反馈不在线：退出世界系闭环、松开这两个轴（折叠轴 b 不受影响）。
     g_gimbal_traj_enable = false;
-    motor_axis_enable(MOTOR_A, false);
-    motor_axis_enable(MOTOR_C, false);
     trajectory_follow_abort();
   }
+  motor_axis_enable(MOTOR_A, yaw_ok);
+  motor_axis_enable(MOTOR_C, pitch_ok);
   g_traj_following = (g_traj_phase == TrajPhase::kFollow);
+  g_traj_status_bits = static_cast<uint8_t>((g_imu_bias_ready ? 1U : 0U) |
+                                            (yaw_ok ? 2U : 0U) | (pitch_ok ? 4U : 0U) |
+                                            (g_traj_following ? 8U : 0U));
 
   // ==========================================================================
   // 示例（默认注释）。换实验时把上面的 ②③ 注释掉，放开其中一个示例即可。

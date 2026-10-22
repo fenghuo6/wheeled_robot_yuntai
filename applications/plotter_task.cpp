@@ -22,6 +22,9 @@ sp::Plotter plotter(&huart1, false);
 //   11 实际 yaw(°)(IMU) | 12 实际 pitch(°)(IMU)
 //   13 yaw 误差 RMS(°) | 14 pitch 误差 RMS(°)
 //   15 yaw 命中率(0~1,比赛计分) | 16 pitch 命中率(0~1,比赛计分)
+//   17 陀螺 Z 零偏(°/s) | 18 状态位图(bit0零偏 bit1 yaw就绪 bit2 pitch就绪 bit3跟随中)
+//      全满足=15; 对齐中=7; 若为 3/11 说明 pitch 轴不可用; 若为 5/13 说明 yaw 轴不可用
+//      （pitch 暂时静止, 原 17/18 的 pitch 诊断量暂不打印）
 //
 // 实际角与目标角同基准（都相对本次使能时的零点），可直接相减得到误差。
 // a/c 是否出力由各自的开关决定（motor_axis_enable）；即使不出力，实际角照常随手动转动变化。
@@ -101,7 +104,8 @@ extern "C" void plotter_task(void const *argument)
       g_motor_a_angle_rel * k_rad_to_deg, g_motor_b_angle_rel * k_rad_to_deg,
       g_motor_c_angle_rel * k_rad_to_deg, g_motor_a_cmd, g_motor_b_cmd, g_motor_c_cmd, yaw_err,
       pitch_err, traj.yaw * k_rad_to_deg, traj.pitch * k_rad_to_deg, g_yaw_rad * k_rad_to_deg,
-      g_pitch_rad * k_rad_to_deg, yaw_rms, pitch_rms, g_yaw_fire_ratio, g_pitch_fire_ratio);
+      g_pitch_rad * k_rad_to_deg, yaw_rms, pitch_rms, g_yaw_fire_ratio, g_pitch_fire_ratio,
+      g_imu_bias_z * k_rad_to_deg, static_cast<float>(g_traj_status_bits));
     osDelay(10);
   }
 }
