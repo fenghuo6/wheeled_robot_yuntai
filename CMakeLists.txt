@@ -67,6 +67,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     sp_middleware/io/dbus/dbus.cpp
     applications/uart_task.cpp
     applications/laser_task.cpp
+    applications/score_detect.cpp
     applications/trajectory_task/trajectory_task.cpp
 
 )

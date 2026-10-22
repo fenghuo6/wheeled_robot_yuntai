@@ -5,21 +5,31 @@
 
 // 单位：角度 rad、速度 rad/s、加速度 rad/s^2。
 
-// 第一版接入先把轨迹做得又慢又小，确认"跟得上、没滞后"之后再放大：
-//   原参数 680ms + yaw45/pitch60 对应峰值 yaw 410°/s、pitch 476°/s，
-//   远超实测能力(yaw≈60°/s, pitch≈60°/s)，会全程饱和。
-//   现在: 5000ms + 20/20  → 峰值 yaw 25°/s、pitch 22°/s，行程 ±10°。
-//   确认机械能到 ±10° 且跟踪良好后，再把两个 RANGE 改回 45/60、PERIOD 逐步减小。
-#define TRAJECTORY_YAW_RANGE_DEG 20.0f
-#define TRAJECTORY_PITCH_RANGE_DEG 20.0f
+// 行程按初始设计值：yaw ±22.5°、pitch ±30°。
+// 【解耦实验结论】pitch 行程临时缩到 ±0.5°(只动 yaw)时，yaw RMS 由 4.3° 降到 3.2~3.5°:
+//   pitch 的反作用力矩只占 yaw 误差的约 1°/23%, 其余 ~3.3° 是 yaw 自身的能力极限。
+// yaw 的带宽核算: ωn = √(kp/J) = √(2/0.0063) ≈ 17.8rad/s ≈ 2.8Hz,
+//   而 680ms 周期的基频 1.47Hz, 只有约 2 倍余量 => 跟踪误差必然大。
+//   要把误差压到 0.5° 需 ωn 提高约 5 倍, 即 kp ≈ 50N·m/rad, 远超稳定性边界。
+//   => 680ms/±22.5° 这个工况下 yaw 的命中率存在物理上限, 靠调参无法达标。
+// ⚠ 调参临时状态: 只调 yaw, pitch 基本不摆动。
+//   PITCH_RANGE 取 0.02°(static_assert 要求 >0), 等效静止, 保持对齐后的位置不动。
+//   yaw 调完之后把 PITCH_RANGE 改回 60.0f。
+#define TRAJECTORY_YAW_RANGE_DEG 45.0f
+#define TRAJECTORY_PITCH_RANGE_DEG 0.02f
 
 #define TRAJECTORY_SAMPLE_INTERVAL_MS 1U
-// 第一版接入时先把轨迹放慢：原 680ms 一个周期时 yaw 峰值 410°/s、pitch 峰值 476°/s，
-// 远超两条轴实测能力(yaw≈60°/s, pitch≈60°/s)，会全程饱和、跟踪严重滞后。
-// 5000ms: 峰值 yaw 25.6°/s、pitch 22.2°/s，实测误差 yaw ±3°、pitch ±6°，平滑不发散。
-// 【不要再往下放慢】试过 10000ms(峰值减半)：误差反而变大且出现周期性"蹭动"振荡 ——
-// 低速时轴频繁落入静摩擦区，走走停停叠加积分卷绕。也就是说精度瓶颈不是带宽，是摩擦。
-#define TRAJECTORY_PERIOD_MS 5000U
+// 【周期按初始设计值 680ms】
+// 之前为了调参和测能力边界，曾把周期放到 5000/3000/2000ms。现在恢复初始值。
+// 实测过的速度-精度关系（完整轨迹周期的误差 RMS，通道 16/17），供判断本次是否够用：
+//   5000ms → yaw 25.6°/s, pitch 22.2°/s : yaw 1.58°, pitch 0.68°
+//   3000ms → yaw 42.7°/s, pitch 37.0°/s : yaw 1.50°, pitch 0.90°   ← yaw 平坦段末尾
+//   2000ms → yaw 64.0°/s, pitch 55.5°/s : yaw 2.30°, pitch 0.90°   ← yaw 开始饱和
+// 结论: yaw 的拐点在 43~64°/s（与早期阶跃测试的"极限约 60°/s"吻合）；
+//       pitch 到 55°/s 仍平坦，瓶颈是与速度无关的常数项(重力矩+减速箱摩擦)而非带宽。
+// 注意: 不要再"放慢"到 10000ms —— 试过，误差反而变大且出现"蹭动"振荡
+//       (低速时轴频繁落入静摩擦区，走走停停叠加积分卷绕)。瓶颈不是带宽，是摩擦。
+#define TRAJECTORY_PERIOD_MS 680U
 #define TRAJECTORY_YAW_MAX_ACCELERATION_RAD_S2 110.0f
 #define TRAJECTORY_PITCH_MAX_ACCELERATION_RAD_S2 70.0f
 #define TRAJECTORY_UPDATE_INTERVAL_MS 1U

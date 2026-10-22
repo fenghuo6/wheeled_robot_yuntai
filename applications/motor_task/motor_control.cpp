@@ -76,17 +76,24 @@ namespace
   // 轨迹本身就在世界系，因此这里直接下发，不做任何偏置换算。
   // 某个轴转向相反时不要去改这里，改 motor_task.cpp 的 k_imu_dir_*。
   //
+  // yaw 与 pitch 都按"绝对角度"对齐：IMU 的 yaw/pitch 零点直接与轨迹角度对应，
+  // 不做整体平移。这样计分程序用 plan_angle 与 imu.yaw 直接比较才有意义；
+  // 若做平移，云台会稳定地差一个常量偏置，判分永远是 0。
+  // 代价：上电后云台要转回轨迹起点（yaw 可能转较大角度），对齐阶段限速 23°/s。
+  //
   // 启动流程：轨迹上电停在起点，云台先限速对齐到"轨迹开始位置"，到位后再放行轨迹，
   // 这样使能瞬间不会从当前姿态直冲轨迹值。
   constexpr float k_align_rate = 0.4f;             // 对齐阶段的角速度上限 rad/s(23°/s)
-  constexpr float k_align_dt = 0.01f;              // 与控制层调用周期(10 ms)一致
-  // 容差 1° 太严: 任何残余力矩缺口(重力/摩擦)都会让误差停在 1~3° 上,
-  // 结果就是永远对不齐、轨迹永远不放行。放到 2° 只影响起步瞬间的姿态精度。
-  constexpr float k_align_tolerance = 0.0349066f;  // 到位判定阈值，2°
+  // 本函数现由 motor_task 每 1 ms 调用一次（原来挂在 10 ms 的 uart_task 上，
+  // 目标值是 10 ms 的阶梯，实测滞后 8 ms 与之一致）。下面两个常量必须跟着周期改。
+  constexpr float k_align_dt = 0.001f;             // 与控制层调用周期(1 ms)一致
+  // 容差 2°→3°: 任何残余力矩缺口(重力/摩擦)都会让误差停在 1~3° 上。
+  // 超时 10s→4s: 起点目标是轨迹表的绝对角度(如 pitch −30°), 机械若到不了就永远进不了
+  // 窗口, 只能靠超时兜底。4 秒足够走完对齐斜坡, 再等下去没有意义。
+  constexpr float k_align_tolerance = 0.0523599f;  // 到位判定阈值，3°
   constexpr uint32_t k_align_hold_ms = 200U;       // 需要连续到位的时长
-  // 兜底: 对齐超过这个时间就强行放行, 避免因为某个轴顶在限位/重力上永久卡死。
-  constexpr uint32_t k_align_timeout_ms = 10000U;
-  constexpr uint32_t k_control_period_ms = 10U;    // 本函数的调用周期(ms)
+  constexpr uint32_t k_align_timeout_ms = 4000U;
+  constexpr uint32_t k_control_period_ms = 1U;     // 本函数的调用周期(ms)
 
   enum class TrajPhase
   {
@@ -99,11 +106,6 @@ namespace
   float g_align_pitch = 0.0f;
   uint32_t g_in_position_ms = 0U;
   uint32_t g_align_ms = 0U;    // 对齐已累计的时间，用于超时兜底
-  float g_yaw_offset = 0.0f;   // 轨迹 yaw 的整体平移量，见 trajectory_follow_update()
-
-  // yaw 没有绝对基准(无磁力计)，把轨迹整体平移到"本次启动时的朝向"，
-  // 避免一上来就要转上百度的误差。pitch 有重力基准，必须保持绝对，不平移。
-  constexpr bool k_yaw_follows_current_heading = true;
 
   float step_toward(float value, float target, float max_step)
   {
@@ -128,7 +130,7 @@ namespace
     g_align_ms = 0U;
   }
 
-  // 每 10 ms 推进一次启动流程。
+  // 每 1 ms 推进一次启动流程。
   // imu_ok 为假（IMU 数据过期）时不推进对齐判定，目标维持当前读数使偏差为 0。
   void trajectory_follow_update(bool imu_ok)
   {
@@ -145,8 +147,6 @@ namespace
         return;
       }
       // 以当前姿态为对齐起点，轨迹此刻仍停在起点。
-      // yaw 偏置取"当前朝向 − 轨迹起点"，于是对齐起点恰好等于当前朝向，起步无跳变。
-      g_yaw_offset = k_yaw_follows_current_heading ? (g_yaw_rad - point.yaw) : 0.0f;
       g_align_yaw = g_yaw_rad;
       g_align_pitch = g_pitch_rad;
       g_in_position_ms = 0U;
@@ -154,18 +154,14 @@ namespace
       g_traj_phase = TrajPhase::kAlign;
     }
 
-    // 偏置在 kIdle 里刚算好，这里再取值，保证第一次对齐就用上正确的目标。
-    const float yaw_target =
-        k_yaw_follows_current_heading ? g_yaw_offset + point.yaw : point.yaw;
-
     if (g_traj_phase == TrajPhase::kAlign) {
       if (imu_ok) {
-        g_align_yaw = step_toward(g_align_yaw, yaw_target, k_align_rate * k_align_dt);
+        g_align_yaw = step_toward(g_align_yaw, point.yaw, k_align_rate * k_align_dt);
         g_align_pitch = step_toward(g_align_pitch, point.pitch, k_align_rate * k_align_dt);
         g_gimbal_yaw_set = g_align_yaw;
         g_gimbal_pitch_set = g_align_pitch;
 
-        const bool in_position = within(g_yaw_rad, yaw_target, k_align_tolerance) &&
+        const bool in_position = within(g_yaw_rad, point.yaw, k_align_tolerance) &&
                                  within(g_pitch_rad, point.pitch, k_align_tolerance);
         g_in_position_ms = in_position ? (g_in_position_ms + k_control_period_ms) : 0U;
         g_align_ms += k_control_period_ms;
@@ -179,17 +175,22 @@ namespace
       return;
     }
 
-    g_gimbal_yaw_set = yaw_target;
+    g_gimbal_yaw_set = point.yaw;
     g_gimbal_pitch_set = point.pitch;
   }
 }  // namespace
 
-// 轨迹阶段诊断（见 motor_task.hpp 说明）。
-volatile uint8_t g_traj_phase_code = 0U;
+// 轨迹是否处于正常跟随阶段（见 motor_task.hpp 说明）。
+volatile bool g_traj_following = false;
 
 // ============================================================================
-// 入口：由 uart_task 每 10 ms 调用一次
+// 入口：由 motor_task 每 1 ms 调用一次
 // ----------------------------------------------------------------------------
+// 调用周期必须是 1 ms：
+//   ① 对齐斜坡的步长(k_align_dt)和各种 ms 计时(k_control_period_ms)都按 1 ms 设计；
+//   ② 目标值的目标就是 1 ms 更新。以前挂在 10 ms 的 uart_task 上，g_gimbal_*_set
+//      是 10 ms 的阶梯信号，而电机每 1 ms 都在追它，等于人为引入 0~10 ms 的额外滞后
+//      （实测 yaw 滞后 8 ms 与之一致）。
 // 顺序固定：① 安全检查 → ② 下发目标与使能。
 // 安全检查必须在前，否则掉线/过热时仍会先下发一次目标再被停。
 // ============================================================================
@@ -255,7 +256,7 @@ extern "C" void motor_control_update(void)
     motor_axis_enable(MOTOR_C, false);
     trajectory_follow_abort();
   }
-  g_traj_phase_code = static_cast<uint8_t>(g_traj_phase);
+  g_traj_following = (g_traj_phase == TrajPhase::kFollow);
 
   // ==========================================================================
   // 示例（默认注释）。换实验时把上面的 ②③ 注释掉，放开其中一个示例即可。
