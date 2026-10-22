@@ -181,15 +181,19 @@ namespace
   //   (0.0012°/LSB, 1kHz 下差分噪声仅 0.02rad/s), 所以这里 kd 可用 ——
   //   yaw 用不了 kd 正是因为 0.044°/LSB 会被放大成 0.77rad/s 的假转速。
   //   kd 的物理含义就是阻尼系数: dout = kd × 转速, 单位 N·m/(rad/s)。
-  constexpr float k_pitch_kp = 2.0f;        // 落在 1~3 之间的已知可动点
+  constexpr float k_pitch_kp = 2.5f;        // 2.0 与 2.5 实测接近(均~0.8), 取 2.5 权限更足
   // kp=2 + kd=0.2 实测: 平滑斜坡跟随、无过冲、无振荡, 力矩干净;
   // 但到位后静差约 2°(高侧到 13°, 低侧到 1.5°)。原因是 kp×2° = 0.11N·m 被摩擦吃掉。
   // 所以需要 I 慢慢积出这 0.11N·m:
   //   增量/秒 = ki × 误差 = 5 × 0.035 ≈ 0.18N·m/s, 约 0.6s 补足, 短于 1s 半周期。
   //   max_iout 必须 ≥ 摩擦(≈0.11), 取 0.6 留余量; 它同时限制大阶跃时的积分卷绕。
   // 若出现"到位后来回蹭"(积分过冲), 只降 ki: 5 → 3 → 2, 不要动 kp/kd。
-  constexpr float k_pitch_ki = 5.0f;        // 消静差
-  constexpr float k_pitch_kd = 0.2f;        // 阻尼; 由 J≈0.0045kg·m² 估算临界值≈0.19
+  constexpr float k_pitch_ki = 5.5f;        // 消静差
+  // ⚠ kd 不能按编码器分辨率来估：轨迹跟随模式下反馈是 g_pitch_rad(IMU 浮点值),
+  //   不是 36:1 编码器。PID 的 D 项 = kd × Δ角度 × 1000, IMU 噪声 0.05~0.1°(0.001rad)
+  //   就会产生 0.2N·m 级的噪声力矩 —— 与摩擦同量级。
+  //   实测: kd=0.25 → RMS 1.3°→3.3°、命中率 0.80→0.15（D 项被噪声打满）。
+  constexpr float k_pitch_kd = 0.2f;        // 实测最优（0.25 会劣化；0.15 待确认）
   constexpr float k_pitch_damp = 0.0f;      // 用 PID 内部 kd 即可, 不再用电机转速阻尼
   constexpr float k_pitch_max_iout = 1.0f;  // 必须打开, 否则积分被限成 0 等于没加;
                                             // 0.6 在 pitch 绝对 -10° 的姿态下不够(实测被卡满后留 1.94° 固定误差),

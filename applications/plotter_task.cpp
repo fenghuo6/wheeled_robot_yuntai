@@ -22,7 +22,6 @@ sp::Plotter plotter(&huart1, false);
 //   11 实际 yaw(°)(IMU) | 12 实际 pitch(°)(IMU)
 //   13 yaw 误差 RMS(°) | 14 pitch 误差 RMS(°)
 //   15 yaw 命中率(0~1,比赛计分) | 16 pitch 命中率(0~1,比赛计分)
-//   17 c 轴 PID 输出(N·m) | 18 pitch 前馈分量(N·m)
 //
 // 实际角与目标角同基准（都相对本次使能时的零点），可直接相减得到误差。
 // a/c 是否出力由各自的开关决定（motor_axis_enable）；即使不出力，实际角照常随手动转动变化。
@@ -102,8 +101,7 @@ extern "C" void plotter_task(void const *argument)
       g_motor_a_angle_rel * k_rad_to_deg, g_motor_b_angle_rel * k_rad_to_deg,
       g_motor_c_angle_rel * k_rad_to_deg, g_motor_a_cmd, g_motor_b_cmd, g_motor_c_cmd, yaw_err,
       pitch_err, traj.yaw * k_rad_to_deg, traj.pitch * k_rad_to_deg, g_yaw_rad * k_rad_to_deg,
-      g_pitch_rad * k_rad_to_deg, yaw_rms, pitch_rms, g_yaw_fire_ratio, g_pitch_fire_ratio,
-      g_motor_c_pid_out, g_pitch_ff_out);
+      g_pitch_rad * k_rad_to_deg, yaw_rms, pitch_rms, g_yaw_fire_ratio, g_pitch_fire_ratio);
     osDelay(10);
   }
 }
