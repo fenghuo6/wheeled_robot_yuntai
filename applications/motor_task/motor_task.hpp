@@ -11,8 +11,8 @@ extern "C" {
 // ============================================================================
 // 电机任务对外接口
 // ----------------------------------------------------------------------------
-// 硬件：motor_a/b 为 GM6020（控制帧 0x1FE，a=ID2 底座、b=ID1 折叠），
-//       motor_c 为 C610 驱动的 M2006（ID 3，控制帧 0x200）。
+// 硬件：motor_a/b 为 GM6020（控制帧 0x2FE，a=ID5 底座、b=ID6 折叠），
+//       motor_c 为 C610 驱动的 M2006（ID 7，控制帧 0x1FF）。
 // 角色：a = yaw，b = 折叠，c = pitch（与 sp::Gimbal 无关，折叠轴单独保持）。
 // 单位：角度 rad、转速 rad/s、转矩 N·m、温度 ℃，均为输出轴侧；
 //       M2006 已按 36:1 减速比换算。
@@ -124,8 +124,27 @@ extern volatile uint32_t g_can1_last_rx_id;
 extern volatile uint32_t g_can1_a_frames;
 extern volatile uint32_t g_can1_b_frames;
 // CAN ID 扫描表（见 motor_task.cpp 说明），slot=0 表示空槽。
-extern volatile uint32_t g_can1_id_slot[4];
-extern volatile uint32_t g_can1_id_count[4];
+// 8 槽是为了同时容纳 3 个电机反馈 + 底盘的 0x123/0x124（两路各记一次）。
+extern volatile uint32_t g_can1_id_slot[8];
+extern volatile uint32_t g_can1_id_count[8];
+
+// ─────────────────── 4.3 底盘链路状态（只读） ───────────────────
+// 底盘 C 板发两帧，接收在 CAN2（板间专用链路）与 CAN1（冗余）两路上都做：
+//   0x123  失能快路径：只在遥控器下档/断线期间发，200 Hz，数据全 0；
+//          "最近 100 ms 内收到过" = 要求云台失能。
+//   0x124  状态心跳：100 Hz 常发，载荷携带完整状态，是 C 板在线的唯一凭据；
+//          data[0] = 0xA5 魔数；
+//          data[1] = bit0 要求失能（与 0x123 同义）| bit1 上档跑完请求跟随。
+// "上档跑完"用状态位而不是事件帧：丢任意一帧都由下一帧补上，接收端无需重发/应答。
+// 只有 0x123 时无法区分"底盘正常"和"底盘没接上"，所以链路判断必须靠 0x124。
+extern volatile bool g_chassis_disable_cmd;  // 0x123 || 0x124.bit0：要求失能
+extern volatile bool g_chassis_online;       // 0x124：C 板在线（100 ms 内收到过）
+// 上电后是否收到过至少一帧 0x124（自锁存）。fail-safe 档位 1 的武装条件：
+// 只在"曾经连上过 C 板"之后才生效，避免单板调试时云台永久失能。
+extern volatile bool g_chassis_heartbeat_seen;
+// 0x124.bit1：上档跑完、请求跟随（电平，链路中断时冻结上一次的值）。
+extern volatile bool g_chassis_follow_cmd;
+// 心跳丢失后的处理策略在 motor_control.cpp 的 ①（见 g_cfg_chassis_link）。
 
 // ─────────────────────── 4.2 折叠轴重力前馈（读写） ───────────────────────
 // 折叠轴在竖直平面内摆动, 重力矩随角度变化: τ(θ) = m·g·r·cos(θ - θ0)。

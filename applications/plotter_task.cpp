@@ -38,10 +38,15 @@ sp::Plotter plotter(&huart1, false);
 //   只在轨迹跟随阶段累积。用它做跨参数、跨速度的客观比较，不要看曲线高矮（GUI 自动缩放）。
 // 15/16 是比赛计分程序的输出：|误差| < 容差(0.5°/1.5°) 的时间占比，1 ms 更新、时间常数 1 s。
 // （GY-56 暂不打印，排查完再换回来。）
+//
+// ★ 调试模式 kPlotLaserOnly = true 时只发 1 个通道：
+//   1 距离(cm) —— 唯一的曲线，上位机按 1 通道解码
+//   改回 false 即恢复下面这套 18 通道电机/轨迹曲线，两边代码都保留。
 // ============================================================================
 extern "C" void plotter_task(void const *argument)
 {
   (void)argument;
+  constexpr bool kPlotLaserOnly = true;
   constexpr float k_rad_to_deg = 57.29578f;
   // 滚动窗口, 长度正好一个轨迹周期: 10ms 一拍 → 周期/10 个样本。
   // 若窗口短于一个周期, 读数会随轨迹相位大幅跳(实测 1 秒窗口能跳 0.97~1.73), 跨参数/跨速度就不可比。
@@ -60,6 +65,14 @@ extern "C" void plotter_task(void const *argument)
 
   while (1)
   {
+    // 只打印红外测距距离，不碰电机/轨迹数据。
+    if (kPlotLaserOnly)
+    {
+      plotter.plot(static_cast<float>(g_gy56_distance_cm));
+      osDelay(10);
+      continue;
+    }
+
     const float yaw_err = (g_gimbal_yaw_set - g_yaw_rad) * k_rad_to_deg;
     const float pitch_err = (g_gimbal_pitch_set - g_pitch_rad) * k_rad_to_deg;
     // 一次取一组自洽的轨迹值（内部有临界区保护），避免 yaw/pitch 来自不同周期。

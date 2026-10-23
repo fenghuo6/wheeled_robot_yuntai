@@ -87,8 +87,18 @@
 //       理由：IMU 装在折叠关节下游，b 一动世界系姿态就整体变化，此时跟随没有意义。
 //       单轴掉线不影响另一轴：track_a / track_c 是分开判定的。
 //
+// 底盘触发（已实现）：底盘上档自动行驶 3.5 m 跑完且车轮停稳后，0x124 载荷的 bit1 置 1，
+// 本文件的 ⓪ 在电平跳变时自动调用 motor_all_track(true)；离开上档后该位清 0，
+// ⓪ 随之调用 motor_all_track(false) 退出跟随。应用层不需要再写触发逻辑。
+//
 // ─────────────────────────── 功能 3：总失能 ───────────────────────────
 // 场景：遥控器失能（遥控器接在底盘 C 板上，通过 CAN 传过来）。
+// 两条通路都已在 motor_task 里接好，本层 update 直接把结果并进失能判定，
+// 无需应用层调用：
+//   0x123（下档/断线时 200 Hz，快路径）+ 0x124.bit0 → g_chassis_disable_cmd；
+//   0x124（所有状态 100 Hz）                        → g_chassis_online，丢失即判不在线。
+// 链路丢失是否失能由 g_cfg_chassis_link 决定（0=不保护 1=收到过心跳后武装 2=始终武装）。
+// 需要软件自行失能时仍可调用本接口：
 //
 //   motor_disable(true);               // 三个轴全部停止输出（b 也松）
 //   motor_disable(false);              // 解除：b 立即重新自锁
@@ -420,6 +430,13 @@ volatile uint16_t g_cfg_ir_trigger_cm = 30U;
 volatile float g_cfg_align_rate_dps = 23.0f;
 volatile float g_cfg_align_tolerance_deg = 3.0f;
 volatile uint32_t g_cfg_align_timeout_ms = 4000U;
+// 底盘心跳（CAN 0x124）丢失的处理策略，三档。默认 0。
+//   0 = 不做链路保护，云台完全按自己的状态工作（与加这套功能之前一致，单板可用）。
+//   1 = 上电后收到过心跳才武装（g_chassis_heartbeat_seen）；此后心跳丢失 → 失能。
+//       底盘没接/没上电/没刷心跳固件时不会把云台锁死，日常调试与比赛都适用。
+//   2 = 始终武装：收不到心跳就失能，包括"开机前线就断了"。
+//       比赛用这一档；代价是云台单独上电时 b 轴不顶，云台臂会因重力下垂。
+volatile uint8_t g_cfg_chassis_link = 0U;
 
 // 折叠阶段（诊断）。
 volatile uint8_t g_fold_phase = 0U;
@@ -454,16 +471,60 @@ void motor_all_track(bool track)
 //   ② 目标值本身就要 1 ms 更新。以前挂在 10 ms 的 uart_task 上，g_gimbal_*_set
 //      是 10 ms 的阶梯信号，而电机每 1 ms 都在追它，等于人为引入 0~10 ms 的额外滞后
 //      （实测 yaw 滞后 8 ms 与之一致）。
-// 顺序固定：① 失能 → ② 过热 → ③ 折叠 → ④ 跟随 → ⑤ 汇总使能。
+// 顺序固定：⓪ 底盘跑完触发 → ① 失能 → ② 过热 → ③ 折叠 → ④ 跟随 → ⑤ 汇总使能。
 // 安全检查必须在前，否则掉线/过热时仍会先下发一次目标再被停。
+// ⓪ 只记录"跟随请求"，真正的执行仍在 ④ 之后，所以放在最前面不会绕过安全逻辑。
 // ============================================================================
+// 调试开关：false = 三个轴一律不出力（失能），用于单独调传感器/上层逻辑时排除电机。
+// true = 正常工作。关闭时连同折叠、跟随、底盘触发一起跳过，本文件不再写任何使能/目标。
+// 注意：三个关节都没有抱闸，失能后云台会因重力下垂，先把机械撑住。
+constexpr bool kMotorOutputEnable = true;
+
 void motor_control_update(void)
 {
   const uint32_t now_ms = static_cast<uint32_t>(osKernelSysTick());
 
+  if (!kMotorOutputEnable)
+  {
+    all_off();
+    return;
+  }
+
+  // ---- ⓪ 底盘"上档跑完"状态位 → 开始 / 停止跟随 ----
+  // g_chassis_follow_cmd 是 0x124 载荷里的 bit1（电平），底盘每 10 ms 刷新一次：
+  //   上档跑完且车轮停稳 → 1（开始跟随）；离开上档 → 0（退出跟随）。
+  // 只在电平变化时动作一次：
+  //   · 电平语义：丢帧不会漏掉，重复帧也不会重复触发；
+  //   · 边沿语义：不会把上层之后主动 motor_all_track(true/false) 的意图每 10 ms 覆盖回去。
+  // 放在 ① 之前：失能期间收到的信号也照常记成"跟随请求"（与 motor_disable 的语义一致，
+  // 解除失能后重新对齐再开始跟随），不会被安全逻辑吞掉。
+  static bool follow_cmd_prev = false;
+  if (g_chassis_follow_cmd != follow_cmd_prev)
+  {
+    motor_all_track(g_chassis_follow_cmd);
+    follow_cmd_prev = g_chassis_follow_cmd;
+  }
+
   // ---- ① 总失能：最高优先级，三个轴全松 ----
   // 失能就是彻底不出力，避免堵转发热。代价是云台会因重力下垂（三个关节都没有抱闸）。
-  if (g_req_disable)
+  // 三个来源并联，任一为真即失能：
+  //   g_req_disable            本层 API（motor_disable）
+  //   g_chassis_disable_cmd    底盘遥控器下档，由 motor_task 从 CAN 0x123 还原（100 ms 超时）
+  //   g_cfg_chassis_link == 1 && 曾收到过心跳 && !g_chassis_online
+  //   g_cfg_chassis_link == 2 && !g_chassis_online
+  //                            底盘心跳（CAN 0x124）丢失 → fail-safe 失能
+  // 【为什么必须有心跳这一路】0x123 只在失能时发，所以"收不到 0x123"既可能是
+  //   "底盘正常行驶"，也可能是"C 板没接上/线断了"。只有常发的 0x124 能把这两种情况分开；
+  //   否则线一断，遥控器下档就静默失效，操作手按了也不会松手。
+  // 【为什么分三档】云台物理上无法区分"底盘正常但没说话"和"底盘不在"，只能由配置决定：
+  //   0 = 不保护（单板调试，与加这套功能之前完全一致）；
+  //   1 = 上电收到过心跳之后才武装（日常；底盘没接也不会把云台锁死在失能）；
+  //   2 = 始终武装（比赛；开机前线就断也保护，代价是"没接底盘 = 云台不出力"）。
+  const bool link_lost =
+      (g_cfg_chassis_link == 2U) ? !g_chassis_online
+      : (g_cfg_chassis_link == 1U) ? (g_chassis_heartbeat_seen && !g_chassis_online)
+                                   : false;
+  if (g_req_disable || g_chassis_disable_cmd || link_lost)
   {
     all_off();
     fold_reset();
@@ -600,8 +661,14 @@ void motor_control_update(void)
   //   }
   //   if (g_fold_phase == 4U) motor_all_track(true);   // 复位完成后开始跟随
 
-  // ── 示例 9：底盘 CAN 遥控器失能（协议定下来之后，需要 chassis_comm 模块）
-  //   协议待定，这里只示意结构：收到失能位就调用，清掉再调用 false。
-  //   motor_disable(g_chassis_disable_cmd);
-  //   if (g_chassis_disable_cmd) return;           // 失能期间不再下发其它动作
+  // ── 示例 9：底盘 CAN 遥控器失能（已实现，无需再写代码）
+  //   协议：底盘在遥控器下档（失能）期间每 1 ms 发标准帧 0x123，解除后停发。
+  //   motor_task 收到后把 g_chassis_disable_cmd 置 true，100 ms 无帧自动清 false，
+  //   本函数开头的 ① 已经把该标志并进总失能判定（失能 > 折叠 > 跟随），
+  //   所以失能期间这里根本不会执行到，无需再额外 return。
+
+  // ── 示例 10：底盘上档跑完 → 开始跟随 / 离开上档 → 停止跟随（已实现）
+  //   跑完 3.5 m 且车轮停稳后，0x124 载荷 bit1 置 1；离开上档自动清 0。
+  //   motor_task 把它解成 g_chassis_follow_cmd，本函数开头的 ⓪ 在跳变时调用
+  //   motor_all_track(true/false)，开始跟随后照 ④ 的流程先对齐再跟随。
 }

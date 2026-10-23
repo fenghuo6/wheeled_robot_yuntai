@@ -33,12 +33,17 @@ extern "C" {
 /* USER CODE END Includes */
 
 extern CAN_HandleTypeDef hcan1;
+/* CAN2：板间专用链路，接收底盘的状态帧（PB5/PB6）。
+   注意：这一路是手工加进 CubeMX 生成代码的，若之后重新生成代码，
+   需要在 CubeMX 里勾上 CAN2（PB5=RX, PB6=TX, 1 Mbps）否则会被覆盖。 */
+extern CAN_HandleTypeDef hcan2;
 
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
 
 void MX_CAN1_Init(void);
+void MX_CAN2_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 
