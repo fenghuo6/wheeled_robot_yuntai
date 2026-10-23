@@ -1,5 +1,3 @@
-#include <cmath>
-
 #include "cmsis_os.h"
 #include "imu_task.hpp"
 #include "io/plotter/plotter.hpp"
@@ -7,121 +5,45 @@
 #include "motor_task/motor_task.hpp"
 #include "score_detect.hpp"
 #include "trajectory_task/trajectory_task.hpp"
-#include "trajectory_task/trajectory_task.hpp"
 
-// 阻塞发送(use_dma = false)：一帧 75 字节 @921600 约 0.8ms，100Hz 下占用很小。
+// 阻塞发送(use_dma = false)：一帧 10 通道 = 42 字节 @921600 约 0.5ms，100Hz 下占用很小。
 // 不走 DMA 是避免上一帧未发完时 HAL 返回 HAL_BUSY 而整帧被静默丢弃，导致上位机一条数据都没有。
 sp::Plotter plotter(&huart1, false);
 
 // ============================================================================
-// 通道分配
+// 通道分配（10 通道）
 //   1 a 实际角(°) | 2 b 实际角(°) | 3 c 实际角(°)
-//   4 a 目标力矩(N·m) | 5 b 目标力矩(N·m) | 6 c 目标力矩(N·m)
-//   7 yaw 误差(°) | 8 pitch 误差(°)
-//   9 轨迹 yaw(°) | 10 轨迹 pitch(°)
-//   11 实际 yaw(°)(IMU) | 12 实际 pitch(°)(IMU)
-//   13 yaw 误差 RMS(°) | 14 pitch 误差 RMS(°)
-//   15 yaw 命中率(0~1,比赛计分) | 16 pitch 命中率(0~1,比赛计分)
-//   17 yaw ILC 补偿力矩(N·m) | 18 状态位图
-//      17 恒为 0 → ILC 没跑起来; 缓慢增长 → 在学, 只是慢
-//      18 低 4 位: bit0零偏 bit1 a就绪 bit2 c就绪 bit3跟随中
-//         全满足=15; 对齐中=7; 为 3/11 说明 c 不可用; 为 5/13 说明 a 不可用
-//      18 高 4 位: 折叠阶段 0=停在0° 1=折叠中 2=停留中 3=复位中 4=复位完成
-//         所以 0x30 = 48 表示"复位完成且未跟随，无轴就绪"
+//   4 IMU 实际 yaw(°) | 5 IMU 实际 pitch(°)
+//   6 轨迹 yaw(°) | 7 轨迹 pitch(°)
+//   8 yaw 命中率(0~1,比赛计分) | 9 pitch 命中率(0~1,比赛计分)
+//   10 红外距离(cm)
 //
-// 实际角与目标角同基准（都相对本次使能时的零点），可直接相减得到误差。
-// a/c 是否出力由 motor_control 的跟随/顶住/松手决策决定；即使不出力，实际角照常随手动转动变化。
-// 7/8 是 目标−实际 的误差，跟踪好时应该贴着 0；用它判断滞后和过冲最直接。
-// 9/10 是 trajectory_task 输出的轨迹本身（世界系角度），未加 yaw 平移偏置；
-//   电机实际在追的目标 = 该值 + g_yaw_offset。
-// 13/14 是误差均方根，窗口正好一个完整轨迹周期（随 TRAJECTORY_PERIOD_MS 自动变化），
-//   只在轨迹跟随阶段累积。用它做跨参数、跨速度的客观比较，不要看曲线高矮（GUI 自动缩放）。
-// 15/16 是比赛计分程序的输出：|误差| < 容差(0.5°/1.5°) 的时间占比，1 ms 更新、时间常数 1 s。
-// （GY-56 暂不打印，排查完再换回来。）
-//
-// ★ 调试模式 kPlotLaserOnly = true 时只发 1 个通道：
-//   1 距离(cm) —— 唯一的曲线，上位机按 1 通道解码
-//   改回 false 即恢复下面这套 18 通道电机/轨迹曲线，两边代码都保留。
+// 实际角是相对本次使能位置的角（使能瞬间为 0），折叠时通道 2 从 0 升到
+//   g_cfg_fold_deg 再回 0。
+// 轨迹是 trajectory_task 输出的世界系角度，未加 yaw 平移偏置；
+//   电机实际在追的目标 = 该值 + g_yaw_offset，所以与 IMU 读数可能差一个常量。
+// 命中率是比赛计分程序的输出：|误差| < 容差(0.5°/1.5°) 的时间占比，
+//   只在轨迹跟随阶段累积，非跟随阶段读数为 0。
 // ============================================================================
+namespace
+{
+constexpr float k_rad_to_deg = 57.29578f;
+constexpr uint32_t k_sample_period_ms = 10U;
+} // namespace
+
 extern "C" void plotter_task(void const *argument)
 {
   (void)argument;
-  constexpr bool kPlotLaserOnly = true;
-  constexpr float k_rad_to_deg = 57.29578f;
-  // 滚动窗口, 长度正好一个轨迹周期: 10ms 一拍 → 周期/10 个样本。
-  // 若窗口短于一个周期, 读数会随轨迹相位大幅跳(实测 1 秒窗口能跳 0.97~1.73), 跨参数/跨速度就不可比。
-  // 跟着 TRAJECTORY_PERIOD_MS 自动变化, 换周期不必改这里。
-  constexpr uint32_t k_sample_period_ms = 10U;
-  constexpr uint32_t k_rms_window = TRAJECTORY_PERIOD_MS / k_sample_period_ms;
-
-  static float yaw_sq[k_rms_window];
-  static float pitch_sq[k_rms_window];
-  uint32_t idx = 0U;
-  uint32_t filled = 0U;
-  float yaw_sum = 0.0f;
-  float pitch_sum = 0.0f;
-  float yaw_rms = 0.0f;
-  float pitch_rms = 0.0f;
 
   while (1)
   {
-    // 只打印红外测距距离，不碰电机/轨迹数据。
-    if (kPlotLaserOnly)
-    {
-      plotter.plot(static_cast<float>(g_gy56_distance_cm));
-      osDelay(10);
-      continue;
-    }
-
-    const float yaw_err = (g_gimbal_yaw_set - g_yaw_rad) * k_rad_to_deg;
-    const float pitch_err = (g_gimbal_pitch_set - g_pitch_rad) * k_rad_to_deg;
     // 一次取一组自洽的轨迹值（内部有临界区保护），避免 yaw/pitch 来自不同周期。
     const TrajectoryPoint traj = trajectory_read();
-
-    // 只统计真正跟随阶段: 对齐阶段目标是内部斜坡, 误差没有意义。
-    if (g_traj_following)
-    {
-      const float ys = yaw_err * yaw_err;
-      const float ps = pitch_err * pitch_err;
-      if (filled == k_rms_window) {
-        yaw_sum -= yaw_sq[idx];
-        pitch_sum -= pitch_sq[idx];
-      }
-      yaw_sq[idx] = ys;
-      pitch_sq[idx] = ps;
-      yaw_sum += ys;
-      pitch_sum += ps;
-      idx = (idx + 1U) % k_rms_window;
-      if (filled < k_rms_window) ++filled;
-
-      // 每满一个周期重算一次和, 避免长时间增量累加的浮点漂移。
-      if (idx == 0U && filled == k_rms_window) {
-        yaw_sum = 0.0f;
-        pitch_sum = 0.0f;
-        for (uint32_t i = 0U; i < k_rms_window; ++i) {
-          yaw_sum += yaw_sq[i];
-          pitch_sum += pitch_sq[i];
-        }
-      }
-      yaw_rms = std::sqrt(yaw_sum / static_cast<float>(filled));
-      pitch_rms = std::sqrt(pitch_sum / static_cast<float>(filled));
-    }
-    else
-    {
-      idx = 0U;
-      filled = 0U;
-      yaw_sum = 0.0f;
-      pitch_sum = 0.0f;
-      yaw_rms = 0.0f;
-      pitch_rms = 0.0f;
-    }
-
     plotter.plot(
       g_motor_a_angle_rel * k_rad_to_deg, g_motor_b_angle_rel * k_rad_to_deg,
-      g_motor_c_angle_rel * k_rad_to_deg, g_motor_a_cmd, g_motor_b_cmd, g_motor_c_cmd, yaw_err,
-      pitch_err, traj.yaw * k_rad_to_deg, traj.pitch * k_rad_to_deg, g_yaw_rad * k_rad_to_deg,
-      g_pitch_rad * k_rad_to_deg, yaw_rms, pitch_rms, g_yaw_fire_ratio, g_pitch_fire_ratio,
-      g_yaw_ilc_out, static_cast<float>(g_traj_status_bits));
-    osDelay(10);
+      g_motor_c_angle_rel * k_rad_to_deg, g_yaw_rad * k_rad_to_deg, g_pitch_rad * k_rad_to_deg,
+      traj.yaw * k_rad_to_deg, traj.pitch * k_rad_to_deg, g_yaw_fire_ratio, g_pitch_fire_ratio,
+      static_cast<float>(g_gy56_distance_cm));
+    osDelay(k_sample_period_ms);
   }
 }

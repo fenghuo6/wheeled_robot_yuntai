@@ -41,6 +41,9 @@ void motor_disable(bool disable);
 //   这样上层每周期无条件调用 motorB_fold_enable(true) 也不会反复折叠。
 void motorB_fold_enable(bool fold);
 
+// 折叠唯一的自动触发源是红外（见 2.1 与 g_cfg_ir_trigger_cm）：上电不会自己折叠。
+// 需要一次性折叠时仍在应用层调用 motorB_fold_enable(true)，或用 motor_control.cpp 示例 6。
+
 // 轨迹跟随。true = 该轴切到 IMU 世界系反馈跟随 trajectory_task 的曲线；
 // false = 该轴退出跟随。两者可独立设置，互不影响。
 // 进入跟随后先限速对齐到轨迹起点（g_cfg_align_rate_dps），到位才放行轨迹。
@@ -54,8 +57,11 @@ void motor_all_track(bool track);
 
 // 折叠角(°)，正值为向后折叠（实测方向）。默认 60。
 extern volatile float g_cfg_fold_deg;
-// 折叠限速(°/s)。折叠臂惯量大且无阻尼，直接给阶跃实测过冲 60%，必须限速。默认 40。
+// 折叠限速(°/s)。折叠臂惯量大且无阻尼，直接给阶跃实测过冲 60%，必须限速。默认 150。
 extern volatile float g_cfg_fold_rate_dps;
+// 折叠软着陆段(°)：进入最后这么长的角度内线性减速，避免高速斜坡突然停住造成过冲。
+// 默认 12；设 0 = 关闭（纯匀速限速，最快但过冲最大）。
+extern volatile float g_cfg_fold_soft_land_deg;
 // 复位限速(°/s)。默认 40。
 extern volatile float g_cfg_unfold_rate_dps;
 // ★ 折叠到位后停留多久再自动复位(ms)。默认 3000。
@@ -64,6 +70,15 @@ extern volatile uint32_t g_cfg_fold_hold_ms;
 // 折叠/复位期间 a/c 是否保持使能位置（true = 顶住，false = 松手）。
 // 默认 true：pitch 无抱闸且有重力矩，松手会直接砸到限位。
 extern volatile bool g_cfg_fold_hold_axes;
+// 复位到位容差(°)：复位斜坡降到 0° 后继续压住 b 轴，实际角度进入该容差才算复位完成。
+// 默认 1.0。摩擦/线缆导致"复位不到位"时看这个值与小一个数量级的效果。
+extern volatile float g_cfg_fold_settle_tol_deg;
+// 复位 settling 超时(ms)：实际角度始终进不了容差时，超过该时间仍判复位完成（避免卡死）。
+// 默认 3000。残差会记在 g_fold_reset_err_deg 里；若每次都超时且残差偏大，
+// 说明 b 轴出力不够 —— 去 motor_task.hpp 的 4.3 调 g_cfg_b_kp / g_cfg_b_ki。
+extern volatile uint32_t g_cfg_fold_settle_timeout_ms;
+// 诊断：复位判完成时 b 轴的实际偏差(°)。正 = 还差一点没回到 0；接近 0 = 真到位。
+extern volatile float g_fold_reset_err_deg;
 // 未跟随轨迹的轴是否保持使能位置。默认 false（与上电行为一致）。
 // 想测单轴、同时不让 pitch 下垂时设为 true。
 extern volatile bool g_cfg_untracked_hold_axes;
@@ -73,7 +88,17 @@ extern volatile bool g_cfg_untracked_hold_axes;
 // 设为 0 = 关闭红外触发（调试期最安全，避免手靠近时误触发折叠）。
 // 阈值只在 g_gy56_online 为 1 时才生效：GY-56 掉线时 g_gy56_distance_cm
 // 会保留最后一个值，不加 online 判断会在传感器拔掉后一直误触发。
+//
+// 【已内置】小于阈值时自动执行一次完整序列：折叠 → 停留 g_cfg_fold_hold_ms → 复位，
+// 不需要应用层再调用 motorB_fold_enable；序列结束后内部自动解锁并重新武装，
+// 所以每次"障碍靠近 → 离开 → 再靠近"都会再折一次。只折叠，不自动开始轨迹跟随。
+// 重新武装的条件：距离回到 阈值+5cm 以外，或者根本测不到（超量程/信号弱/离线）——
+// 后者是障碍移开时的常见表现，两者都算"离开"，避免空旷场景下只折一次就不再触发。
+// 前提：g_cfg_fold_hold_ms > 0（默认 3000），否则折到位后不自动复位。
+// 注意：启用后由本层独占折叠请求，应用层不要再直接调 motorB_fold_enable()。
 extern volatile uint16_t g_cfg_ir_trigger_cm;
+// 红外触发完成的序列次数（诊断）：每走完一次折叠+复位 +1。
+extern volatile uint32_t g_ir_fold_count;
 
 // 对齐阶段角速度上限(°/s)。默认 23。
 extern volatile float g_cfg_align_rate_dps;

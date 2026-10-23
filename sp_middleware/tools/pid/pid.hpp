@@ -51,9 +51,12 @@ public:
   // 清零PID的所有状态（输出与缓存等）
   void clear();
 
+  // 运行期修改增益（调试调参用；不影响已有积分/微分状态）
+  void set_gains(float kp, float ki, float kd);
+
 private:
   const float dt_;
-  const float kp_, ki_, kd_;
+  float kp_, ki_, kd_;
   const float max_out_, max_iout_;
   const float alpha_;
   const bool angular_;  // 是否为角度控制

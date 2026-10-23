@@ -124,12 +124,12 @@ extern volatile uint32_t g_can1_last_rx_id;
 extern volatile uint32_t g_can1_a_frames;
 extern volatile uint32_t g_can1_b_frames;
 // CAN ID 扫描表（见 motor_task.cpp 说明），slot=0 表示空槽。
-// 8 槽是为了同时容纳 3 个电机反馈 + 底盘的 0x123/0x124（两路各记一次）。
+// 只统计 CAN1 的电机反馈；底盘帧走 CAN2，不占槽位。
 extern volatile uint32_t g_can1_id_slot[8];
 extern volatile uint32_t g_can1_id_count[8];
 
 // ─────────────────── 4.3 底盘链路状态（只读） ───────────────────
-// 底盘 C 板发两帧，接收在 CAN2（板间专用链路）与 CAN1（冗余）两路上都做：
+// 底盘 C 板发两帧，只在 CAN2（板间专用链路）上接收，CAN1 不再处理任何底盘帧：
 //   0x123  失能快路径：只在遥控器下档/断线期间发，200 Hz，数据全 0；
 //          "最近 100 ms 内收到过" = 要求云台失能。
 //   0x124  状态心跳：100 Hz 常发，载荷携带完整状态，是 C 板在线的唯一凭据；
@@ -159,6 +159,17 @@ extern volatile float g_fold_cal_amp;    // 拟合出的 A(N·m)
 extern volatile float g_fold_cal_phase;  // 拟合出的 θ0(rad)
 extern volatile uint32_t g_fold_cal_state;  // 0 空闲 / 1 采集中 / 2 已完成
 extern volatile float g_motor_b_pid_out;    // 不含前馈的 PID 输出(N·m)
+
+// ─────────────────────── 4.3 折叠轴角度环增益（运行期可调） ───────────────────────
+// 默认值与原 constexpr 一致；调试器里改这几个量立刻生效（1 ms 内同步到 PID），
+// 不需要重新编译。用于解决"复位不到位"这类静差问题：
+//   · 静差大 → 适当加大 kp，或加大 ki 让积分更快顶过静摩擦；
+//   · 大角度阶跃过冲 → 减小 kp 或把 integral_pause 调小（积分更早暂停）。
+// 注意 ki 是纯 I 系数，没有变速积分；积分上限 k_fold_max_iout = 1.5 N·m。
+extern volatile float g_cfg_b_kp;              // N·m/rad，默认 1.5
+extern volatile float g_cfg_b_ki;              // N·m/(rad·s)，默认 0.05
+extern volatile float g_cfg_b_integral_pause;  // 积分分离阈值(N·m)，默认 0.2；0 = 不暂停
+extern volatile float g_fold_settling;         // 1 = 复位微调中（诊断，control 层写）
 
 // ─────────────────────── 5. 任务入口 ───────────────────────
 void motor_task(void const * argument);

@@ -33,8 +33,9 @@
 // ============================================================================
 // 用法示例
 // ----------------------------------------------------------------------------
-// 本层只负责"把某个动作做出来"，不判断"什么时候该做"。触发条件（红外距离、
-// 底盘 CAN 命令、遥控器开关）由上层决定，判断完调用下面的接口即可。
+// 本层只负责"把某个动作做出来"，不判断"什么时候该做"。触发条件（底盘 CAN 命令、
+// 遥控器开关）由上层决定，判断完调用下面的接口即可。（红外距离触发是例外：
+// 已在控制层内置，见 2.1 与示例 8，应用层无需介入。）
 // 三个动作互相独立，同时请求时按优先级仲裁：失能 > 折叠 > 跟随。
 // 所有接口都只是写一个 bool 请求量，可在任意任务/中断里调用（上电初值全为 0，
 // 即"不动作"），真正的执行在 motor_control_update() 里每 1 ms 做一次。
@@ -113,11 +114,16 @@
 // ─────────────────────────── 参数与状态观察 ───────────────────────────
 // 全部参数都是 volatile 全局量（见 motor_control.hpp），调试器里直接改，立刻生效：
 //   ── 折叠 ──
-//   g_cfg_fold_deg           折叠角(°)          默认 60
-//   g_cfg_fold_rate_dps      折叠限速(°/s)      默认 40
+//   g_cfg_fold_deg           折叠角(°)          默认 100
+//   g_cfg_fold_rate_dps      折叠限速(°/s)      默认 150（调试器里可再快）
+//   g_cfg_fold_soft_land_deg 折叠软着陆段(°)    默认 12，0 = 关闭（过冲会变大）
 //   g_cfg_unfold_rate_dps    复位限速(°/s)      默认 40
 //   g_cfg_fold_hold_ms       ★停留时间(ms)     默认 3000，0 = 不自动复位
 //   g_cfg_fold_hold_axes     折叠时 a/c 顶住     默认 true
+//   g_cfg_fold_settle_tol_deg 复位到位容差(°)   默认 1.0（进不了就一直压住 b 轴）
+//   g_cfg_fold_settle_timeout_ms 复位settle超时 默认 3000
+//   g_fold_reset_err_deg     复位完成时实际偏差(°)（诊断，读它就知道差多少）
+//   g_fold_settling          1 = 复位微调中（诊断；此期间 b 轴积分分离被关掉）
 //   ── 红外触发 ──
 //   g_cfg_ir_trigger_cm      ★距离阈值(cm)     默认 30，0 = 关闭红外触发
 //   ── 轨迹跟随 ──
@@ -152,6 +158,7 @@ namespace
 
   // 控制层对外一律用"度"，底层 rad 只在写入 g_motor_*_angle_set 时换算。
   constexpr float k_deg_to_rad = 3.14159265f / 180.0f;
+  constexpr float k_rad_to_deg = 57.29578f; // 读反馈量（rad）做判断时用
 
   // 控制层内部按 1 ms 一拍推进，斜坡步长都用 0.001 s。
   constexpr float k_control_dt = 0.001f;
@@ -196,6 +203,9 @@ namespace
   FoldPhase g_fold_ph = FoldPhase::kAtZero;
   float g_fold_ref_deg = 0.0f;        // 限速后的折叠目标角(°)，跨周期保留
   uint32_t g_fold_hold_start_ms = 0U; // 进入停留阶段的时刻
+  // 复位斜坡第一次走到 0 的时刻。0 = 本次复位还没到 0。
+  // 用来给"目标到 0 但机械没到"的等待限时（见 kUnfolding）。
+  uint32_t g_fold_zero_ms = 0U;
   // 本次请求是否已经跑过一遍。跑过就锁住，避免"请求一直是 true"时反复折叠：
   // 上层若每周期都调 motorB_fold_enable(true)，没有这个锁存就会
   // 折叠→停留→复位→再折叠…无限循环。想再折一次必须先调 false 把它解锁。
@@ -214,6 +224,7 @@ namespace
     g_fold_ph = FoldPhase::kAtZero;
     g_fold_ref_deg = 0.0f;
     g_fold_hold_start_ms = 0U;
+    g_fold_zero_ms = 0U;
     g_fold_ran = false;
     g_req_fold = false;
     g_fold_phase = static_cast<uint8_t>(FoldPhase::kAtZero);
@@ -231,6 +242,14 @@ namespace
     // 请求拉低 = 解锁，允许下一次折叠。想再折一次必须先调 motorB_fold_enable(false)。
     if (!g_req_fold)
       g_fold_ran = false;
+
+    // 每次进入复位段都重新计时（中途取消折叠也会转进复位）。
+    if (g_fold_ph != FoldPhase::kUnfolding)
+      g_fold_zero_ms = 0U;
+
+    // 复位微调标志：默认 0，只在 kUnfolding 的"目标已到 0 但实际没到"时置 1，
+    // motor_task 据此关掉折叠轴的积分分离，让积分把静摩擦残差顶平。
+    g_fold_settling = 0.0f;
 
     switch (g_fold_ph)
     {
@@ -252,7 +271,23 @@ namespace
         g_fold_ph = FoldPhase::kUnfolding;
         break;
       }
-      g_fold_ref_deg += step_fold;
+      {
+        // 接近目标时线性减速（软着陆）：高速斜坡突然停住会把速度差全部变成过冲，
+        // 实测 40°/s 时都过冲 60%。减速段内保留 15% 的最低速，避免最后几度磨太久。
+        float step = step_fold;
+        if (g_cfg_fold_soft_land_deg > 0.0f)
+        {
+          const float remain = g_cfg_fold_deg - g_fold_ref_deg;
+          if (remain < g_cfg_fold_soft_land_deg)
+          {
+            step *= remain / g_cfg_fold_soft_land_deg;
+            const float min_step = step_fold * 0.15f;
+            if (step < min_step)
+              step = min_step;
+          }
+        }
+        g_fold_ref_deg += step;
+      }
       if (g_fold_ref_deg >= g_cfg_fold_deg)
       {
         g_fold_ref_deg = g_cfg_fold_deg;
@@ -276,17 +311,111 @@ namespace
       break;
 
     case FoldPhase::kUnfolding:
-      g_fold_ref_deg -= step_unfold;
-      if (g_fold_ref_deg <= 0.0f)
+    {
+      // 斜坡把"目标"降到 0°。
+      if (g_fold_ref_deg > 0.0f)
       {
-        g_fold_ref_deg = 0.0f;
+        g_fold_ref_deg -= step_unfold;
+        if (g_fold_ref_deg < 0.0f)
+          g_fold_ref_deg = 0.0f;
+      }
+      if (g_fold_ref_deg > 0.0f)
+        break;
+
+      // 目标到 0 不代表机械到 0：限速斜坡一停，摩擦/线缆/重力会让 b 轴停在
+      // 差几度的位置（实测约 2~5°）。以前到这里立刻判 kDone，上层就以为已复位。
+      // 现在的做法是继续以 0° 为目标压住 b 轴（等于再"调"一段），
+      // 直到实际角度进入 g_cfg_fold_settle_tol_deg 才算复位完成；
+      // 始终进不去（静摩擦卡住）则超过 g_cfg_fold_settle_timeout_ms 后放行，
+      // 并把残差记到 g_fold_reset_err_deg 供调试观察。
+      if (g_fold_zero_ms == 0U)
+        g_fold_zero_ms = now_ms;
+
+      const float err_deg = g_motor_b_angle_rel * k_rad_to_deg;
+      const float abs_err_deg = (err_deg >= 0.0f) ? err_deg : -err_deg;
+      const bool settled = abs_err_deg <= g_cfg_fold_settle_tol_deg;
+      const bool timeout = (now_ms - g_fold_zero_ms) >= g_cfg_fold_settle_timeout_ms;
+      if (settled || timeout)
+      {
+        g_fold_reset_err_deg = err_deg;
         g_fold_ph = FoldPhase::kDone;
       }
+      else
+      {
+        // 告诉 motor_task：现在在"压住 b 轴做微调"，积分不要暂停，
+        // 否则静摩擦造成的几度残差会被积分分离冻住，永远回不到 0°。
+        g_fold_settling = 1.0f;
+      }
       break;
+    }
     }
 
     motor_angle(MOTOR_B, g_fold_ref_deg);
     g_fold_phase = static_cast<uint8_t>(g_fold_ph);
+  }
+
+  // ─────────────────────── 3.1 红外遮挡 → 折叠并复位一次 ───────────────────────
+  // 触发条件：GY-56 在线、测距状态可靠、距离 < g_cfg_ir_trigger_cm（0 = 关闭）。
+  // 一次序列 = 折叠 → 停留 g_cfg_fold_hold_ms → 复位，全部由上面的状态机完成；
+  // 本函数只负责"发起请求"和"序列结束后解锁"，不需要应用层再写触发代码。
+  // 序列结束后不自动开始轨迹跟随（跟随请求由应用层/示例区决定）。
+  // 上电不会自己折叠：唯一的触发源是红外（或应用层直接调 motorB_fold_enable）。
+  // 要求 g_cfg_fold_hold_ms > 0（默认 3000），否则折叠后不会自动复位，序列停在保持位。
+  //
+  // 重新武装有回差：必须离开"阈值 + k_ir_release_cm"才允许下一次触发，
+  // 否则目标停在 30cm 附近时，会在阈值上下反复折叠、反复触发。
+  constexpr uint16_t k_ir_release_cm = 5U;
+  bool g_ir_armed = true;    // true = 允许触发下一次
+  bool g_ir_folding = false; // true = 已发起折叠序列，等它复位完成
+
+  // 距离是否可信：离线或测距状态非"可靠"时，g_gy56_distance_cm 可能是上一次的旧值
+  // （例如超量程、信号弱），此时不能拿它做触发判断。
+  bool ir_distance_valid() { return g_gy56_online && g_gy56_range_status == 0U; }
+
+  void ir_fold_update()
+  {
+    // 已发起：等整条序列跑完（kDone = 复位完成）再解锁请求、重新武装。
+    if (g_ir_folding)
+    {
+      if (!g_req_fold)
+      {
+        // 请求已被 fold_reset() 撤销（总失能、过热等）：放弃本次序列。
+        // 不直接重新武装，要求先离开遮挡区，避免解除失能后立即又折一次。
+        g_ir_folding = false;
+        g_ir_armed = false;
+      }
+      else if (g_fold_ph == FoldPhase::kDone)
+      {
+        motorB_fold_enable(false); // 复位完成 → 解锁，允许下一次折叠
+        g_ir_folding = false;
+        g_ir_armed = false;
+        ++g_ir_fold_count;
+      }
+      return;
+    }
+
+    // 未触发：等障碍离开后再武装。
+    // 注意"离开"有两种表现：距离变大（> 阈值+回差），或者根本测不到（超量程/信号弱/
+    // 模块离线）。后者是把手/障碍移开时最常见的情况 —— 若要求"必须测到 >35cm 才武装"，
+    // 空旷场景下会永远武装不上，表现为"只折一次就不再触发"。
+    // 触发侧仍要求数据可信，所以这里放宽不会导致误触发。
+    if (!g_ir_armed)
+    {
+      if (!ir_distance_valid() || g_gy56_distance_cm > g_cfg_ir_trigger_cm + k_ir_release_cm)
+        g_ir_armed = true;
+      return;
+    }
+
+    if (g_cfg_ir_trigger_cm == 0U || !ir_distance_valid())
+      return;
+    if (g_gy56_distance_cm >= g_cfg_ir_trigger_cm)
+      return;
+    if (fold_busy())
+      return; // 已有折叠流程在跑（应用层自己发起的），等它结束再触发
+
+    motorB_fold_enable(true);
+    g_ir_folding = true;
+    g_ir_armed = false;
   }
 
   // ─────────────────────── 4. 轨迹跟随 ───────────────────────
@@ -419,11 +548,18 @@ volatile uint8_t g_traj_status_bits = 0U;
 volatile float g_yaw_ilc_out = 0.0f;
 
 // ─────────────────────────── 可调参数（默认值） ───────────────────────────
-volatile float g_cfg_fold_deg = 60.0f;
-volatile float g_cfg_fold_rate_dps = 40.0f;
+volatile float g_cfg_fold_deg = 100.0f;
+volatile float g_cfg_fold_rate_dps = 150.0f;
 volatile float g_cfg_unfold_rate_dps = 40.0f;
 volatile uint32_t g_cfg_fold_hold_ms = 3000U;
+// 折叠最后这一段(°)内按剩余角度线性减速，避免高速斜坡突然停住造成过冲；0 = 关闭。
+volatile float g_cfg_fold_soft_land_deg = 12.0f;
 volatile bool g_cfg_fold_hold_axes = true;
+// 复位 settling：斜坡到 0 后继续压住 b 轴，等实际角度进容差才算复位完成。
+volatile float g_cfg_fold_settle_tol_deg = 1.0f;
+volatile uint32_t g_cfg_fold_settle_timeout_ms = 3000U;
+// 诊断：复位判完成时 b 轴的实际偏差(°)。
+volatile float g_fold_reset_err_deg = 0.0f;
 volatile bool g_cfg_untracked_hold_axes = false;
 // 红外触发阈值(cm)，0 = 关闭。实际使用见 motor_control_update() 的示例 8。
 volatile uint16_t g_cfg_ir_trigger_cm = 30U;
@@ -437,6 +573,9 @@ volatile uint32_t g_cfg_align_timeout_ms = 4000U;
 //   2 = 始终武装：收不到心跳就失能，包括"开机前线就断了"。
 //       比赛用这一档；代价是云台单独上电时 b 轴不顶，云台臂会因重力下垂。
 volatile uint8_t g_cfg_chassis_link = 0U;
+
+// 红外遮挡触发的完成次数（诊断）：每走完一次"遮挡→折叠→停留→复位"序列 +1。
+volatile uint32_t g_ir_fold_count = 0U;
 
 // 折叠阶段（诊断）。
 volatile uint8_t g_fold_phase = 0U;
@@ -543,6 +682,8 @@ void motor_control_update(void)
 
   // ---- ③ 折叠轴：先算目标角，再决定 a/c 用哪种反馈 ----
   // b 恒随总使能自锁，重力矩由 motor_task 的前馈承担。
+  // 红外触发只写折叠请求，由下面的状态机推进，所以放在 fold_update 之前。
+  ir_fold_update();
   fold_update(now_ms);
   motor_enable(true);
 
@@ -628,10 +769,12 @@ void motor_control_update(void)
   //   退出：motorA_track(false);
 
   // ── 示例 3：轨迹跟随——只跟 pitch
-  // motorC_track(true);
+  //   本条保持注释。红外触发只负责折叠，不会自动放行跟随；
+  //   需要跟随时在这里放开 motor_all_track(true)（两轴）或单轴接口。
+  //   motorC_track(true);
   //   退出：motorC_track(false);
 
-  // ── 示例 4：折叠——停在折叠位不自动复位（先把 g_cfg_fold_hold_ms 设为 0）
+  // ── p示例 4：折叠——停在折叠位不自动复位（先把 g_cfg_fold_hold_ms 设为 0）
   //   g_cfg_fold_hold_ms = 0U 时折叠到位后会一直保持 60°，不会自己往回走。
   //   想复位时再调用一次 motorB_fold_enable(false)。
   //  motorB_fold_enable(true);
@@ -651,15 +794,14 @@ void motor_control_update(void)
   //   motor_disable(true);
   //   解除：motor_disable(false);
 
-  // ── 示例 8：接红外测距（GY-56 修好后，需要 #include "laser_task.hpp"）
-  //   阈值在 g_cfg_ir_trigger_cm（默认 30cm，0 = 关闭红外触发），调试器里可改。
-  //   必须判 g_gy56_online：掉线时 g_gy56_distance_cm 会保留最后一个值，
-  //   不判 online 会在传感器拔掉后一直误触发折叠。
-  //   if (g_cfg_ir_trigger_cm > 0U && g_gy56_online &&
-  //       g_gy56_distance_cm < g_cfg_ir_trigger_cm) {
-  //     motorB_fold_enable(true);                  // 检测到障碍 → 折叠（只折一次）
-  //   }
-  //   if (g_fold_phase == 4U) motor_all_track(true);   // 复位完成后开始跟随
+  // ── 示例 8：红外测距触发折叠（已实现，无需再写代码）
+  //   阈值 g_cfg_ir_trigger_cm（默认 30cm，0 = 关闭），调试器里可改。
+  //   距离小于阈值就自动跑一次"折叠 → 停留 g_cfg_fold_hold_ms → 复位"，
+  //   逻辑在 ③ 前的 ir_fold_update()：序列完成才解锁，障碍离开后重新武装，
+  //   所以每次"靠近 → 离开 → 再靠近"都会再折一次（g_ir_fold_count 可看次数）。
+  //   "离开"= 距离 > 阈值+5cm 或 测不到（超量程/信号弱/离线）。
+  //   只折叠不跟随：需要跟随时在示例 1/2/3 里放开对应行。
+  //   前提：g_gy56_online 且测距状态可靠（避免掉线/超量程时用旧值误触发）。
 
   // ── 示例 9：底盘 CAN 遥控器失能（已实现，无需再写代码）
   //   协议：底盘在遥控器下档（失能）期间每 1 ms 发标准帧 0x123，解除后停发。
@@ -671,4 +813,8 @@ void motor_control_update(void)
   //   跑完 3.5 m 且车轮停稳后，0x124 载荷 bit1 置 1；离开上档自动清 0。
   //   motor_task 把它解成 g_chassis_follow_cmd，本函数开头的 ⓪ 在跳变时调用
   //   motor_all_track(true/false)，开始跟随后照 ④ 的流程先对齐再跟随。
+
+  // ── 示例 11：上电自动折叠 —— 已移除
+  //   上电不再自己折叠，唯一触发源是红外（见示例 8）。
+  //   需要一次性折叠时用示例 6 的两行写法，把 g_cfg_fold_hold_ms 设成需要的停留时间。
 }

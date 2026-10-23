@@ -162,4 +162,12 @@ void PID::clear()
   this->dout_ready_ = false;
 }
 
+// 调试用：在调试器里改增益即可生效，不清积分/微分状态，避免调参瞬间产生冲击。
+void PID::set_gains(float kp, float ki, float kd)
+{
+  kp_ = kp;
+  ki_ = ki;
+  kd_ = kd;
+}
+
 }  // namespace sp
