@@ -39,11 +39,11 @@ volatile std::uint32_t g_can1_id_count[8] = {0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U};
 // ----------------------------------------------------------------------------
 // 职责：唯一直接操作 CAN 与 PID 的模块。
 //   1. 接收 RM 电机反馈帧（CAN1），维护各电机的角度/转速/转矩/温度/在线状态；
-//   2. 接收底盘帧（CAN2 专用链路，轮询）：0x123（失能快路径）/ 0x124（状态心跳，
-//      载荷含失能与跑完位），还原成 g_chassis_disable_cmd / g_chassis_online /
-//      g_chassis_follow_cmd；CAN1 上不再处理任何底盘帧；
-//   3. 每 1 ms 跑一次角度环，把目标角度换算成转矩指令；
-//   4. 按控制帧打包下发（两台 GM6020 共用 0x2FE，M2006 用 0x1FF）。
+//   2. 每 1 ms 跑一次角度环，把目标角度换算成转矩指令；
+//   3. 按控制帧打包下发（两台 GM6020 共用 0x2FE，M2006 用 0x1FF）。
+// 失能信号来源：独立遥控器接收机（DBus，USART3）；右下开关拨到底要求失能。
+//   该信号由 uart_task 每 10 ms 写入 g_chassis_disable_cmd / g_chassis_online，
+//   本任务只读，不直接解析遥控器。CAN1/CAN2 上都不再有任何底盘协议帧。
 // 数据来源：目标由 motor_control.cpp 写入全局量，反馈由 CAN 中断写入电机对象。
 // 单位约定：角度 rad、转速 rad/s、转矩 N·m、温度 ℃，均为输出轴侧。
 // ============================================================================
@@ -58,53 +58,9 @@ namespace
   // M2006 带 36:1 减速箱，传入减速比后角度、转速、指令均为输出轴侧单位。
   sp::RM_Motor motor_c(7, sp::RM_Motors::M2006, sp::M2006_P36);
 
-  // 板间专用链路的过滤器配置对象（只借它配过滤器，接收走 poll_chassis_can）。
-  sp::CAN can_chassis(&hcan2);
-
-  // ──────────── 底盘帧（只走 CAN2）：0x123 失能快路径 / 0x124 状态心跳 ────────────
-  // 0x123：只在底盘下档/断线时发（200 Hz），数据全 0。收到即视为要求失能；
-  //        "最近 100 ms 内收到过"这就是失能电平。
-  // 0x124：100 Hz 常发，载荷携带完整状态（抗丢帧，丢任意一帧由下一帧补上）：
-  //        data[0] = 魔数 0xA5（滤掉残留/外来帧）
-  //        data[1] = bit0 要求失能（与 0x123 同义，冗余）| bit1 上档跑完请求跟随
-  // 只有 0x123 时无法区分"底盘正常（不发 0x123）"和"底盘没接上（收不到任何帧）"，
-  // 所以"C 板是否在线"必须靠常发的 0x124。
-  constexpr std::uint32_t k_estop_rx_id = 0x123U;
-  constexpr std::uint32_t k_estop_timeout_ms = 100U;
-  constexpr std::uint32_t k_heartbeat_rx_id = 0x124U;
-  constexpr std::uint32_t k_chassis_link_timeout_ms = 100U;
-  constexpr std::uint8_t k_chassis_magic = 0xA5U;
-  constexpr std::uint8_t k_chassis_bit_estop = 0x01U;
-  constexpr std::uint8_t k_chassis_bit_auto_done = 0x02U;
-  volatile std::uint32_t g_estop_stamp_ms = 0U;     // 0x123 最近一帧的时刻
-  volatile std::uint32_t g_heartbeat_stamp_ms = 0U; // 0x124 最近一帧的时刻
-  volatile std::uint8_t g_chassis_state_bits = 0U;  // 0x124 载荷里的状态位
-  // 收到过才有意义：上电时时间戳是 0，直接相减会把"从没收到"误判成"刚收到"。
-  volatile bool g_estop_seen = false;
-
-  // 底盘帧解析：只记录到达时刻与状态，判定在 1 ms 任务里做（中断上下文不调用控制层）。
-  void process_chassis_frame(std::uint32_t id, const std::uint8_t *data)
-  {
-    const std::uint32_t stamp_ms = static_cast<std::uint32_t>(osKernelSysTick());
-
-    if (id == k_estop_rx_id)
-    {
-      g_estop_stamp_ms = stamp_ms;
-      g_estop_seen = true;
-      return;
-    }
-    if (id == k_heartbeat_rx_id)
-    {
-      // 校验魔数：只有协议帧才更新状态，避免总线上的残留/外来帧被当成命令。
-      if (data[0] == k_chassis_magic)
-        g_chassis_state_bits = data[1];
-      g_heartbeat_stamp_ms = stamp_ms;
-      g_chassis_heartbeat_seen = true; // 自锁存：曾连上过 C 板
-    }
-  }
 
   // ─────────────────── 2. 电机反馈解析（CAN1 回调） ───────────────────
-  // 只处理 RM 电机反馈帧；底盘帧已从这条路径移除（全部走 CAN2，见 process_chassis_frame）。
+  // 只处理 RM 电机反馈帧；这里不再出现任何底盘帧（失能信号改由遥控器接收机提供）。
   // 同时统计实际收到的 CAN ID，用于确认 GM6020 反馈报文 ID 是否与 rm_motor 的假设一致。
   void process_motor_feedback(std::uint32_t id, const std::uint8_t *data, bool extended)
   {
@@ -144,25 +100,6 @@ namespace
     }
     if (id == motor_c.rx_id)
       motor_c.read(data, stamp_ms);
-  }
-
-  // ─────────────────────── 2.1 CAN2 板间链路（轮询接收） ───────────────────────
-  // 底盘帧（0x123/0x124）只从 CAN2 接收，与电机总线（CAN1）完全分开。
-  // CAN2 不注册接收中断，改为在 1 ms 任务里排空 FIFO：
-  //   · 数据量只有 100~200 Hz，FIFO 深度 3，1 ms 轮询有充足余量；
-  //   · 这里直接用 HAL 取帧，不复用 sp::CAN::recv()：那个函数里的接收头是 static，
-  //     与 CAN1 的 ISR 并发调用会互相覆盖。
-  void poll_chassis_can()
-  {
-    CAN_RxHeaderTypeDef header;
-    std::uint8_t data[8];
-    while (HAL_CAN_GetRxFifoFillLevel(&hcan2, CAN_RX_FIFO0) > 0)
-    {
-      if (HAL_CAN_GetRxMessage(&hcan2, CAN_RX_FIFO0, &header, data) != HAL_OK)
-        return;
-      if (header.IDE != CAN_ID_EXT)
-        process_chassis_frame(header.StdId, data);
-    }
   }
 
   // ============================================================================
@@ -541,15 +478,20 @@ volatile bool g_motor_c_loop_enable = false;
 // 轨迹跟随模式：1 时 a(yaw)/c(pitch) 用 IMU 世界系姿态作反馈；初值 0。
 volatile bool g_gimbal_traj_a = false;
 volatile bool g_gimbal_traj_c = false;
-// 底盘急停请求：由 CAN 0x123 帧还原出的电平量，每 1 ms 刷新（见 motor_task.hpp）。
+// 失能请求：由独立遥控器接收机（DBus，USART3）的右下开关给出，uart_task 每 10 ms 刷新。
 volatile bool g_chassis_disable_cmd = false;
-// 底盘链路在线：CAN 0x124 心跳在 100 ms 内到达过，每 1 ms 刷新（见 motor_task.hpp）。
+// 遥控接收机在线：100 ms 内收到过有效 DBus 帧（uart_task 刷新）。
 volatile bool g_chassis_online = false;
-// 上电后是否收到过至少一帧 0x124（自锁存）。fail-safe 的档位 1 用它做武装条件，
-// 否则单板调试 / 底盘没上电时云台会永久失能（b 轴不顶，云台直接下垂）。
+// 上电后是否收到过至少一帧 DBus（自锁存）。fail-safe 档位 1 用它做武装条件，
+// 否则单板调试 / 接收机没上电时云台会永久失能（b 轴不顶，云台直接下垂）。
 volatile bool g_chassis_heartbeat_seen = false;
-// 底盘"上档跑完"请求跟随：直接取 0x124 载荷的 bit1（电平，非事件）。
+// 自动跟随请求（电平量）：由遥控器右开关驱动，uart_task 每 10 ms 刷新。
+//   UP   = g_chassis_follow_cmd：测试档，立刻跟随（yaw+pitch）
+//   MID  = g_chassis_auto_cmd  ：自动档，折叠复位完成后延时再跟随
+//   DOWN = g_chassis_disable_cmd：失能（最高优先级）
+// 原底盘"上档跑完→请求跟随"信号已随底盘 CAN 协议一并移除。
 volatile bool g_chassis_follow_cmd = false;
+volatile bool g_chassis_auto_cmd = false;
 
 // ───────────────────────────── 2. 目标值 ─────────────────────────────
 // 轨迹跟随的世界系目标角(rad)。
@@ -640,37 +582,12 @@ extern "C" void motor_task(void const *argument)
   sp::can1.start();
   sp::can1.set_rx_callback(process_motor_feedback);
 
-  // ---- 初始化：CAN2 板间链路（底盘 0x123/0x124 的专用通路）----
-  // 只启动收发、不激活接收通知：接收在 1 ms 任务里轮询（见 poll_chassis_can）。
-  // 过滤器 bank 由 sp::CAN 按 hcan2 自动选 14（CAN2 只能访问 14~27 号 bank）。
-  can_chassis.config();
-  HAL_CAN_Start(&hcan2);
-
   bool pid_was_enabled = false;
   TickType_t wake_tick = xTaskGetTickCount();
 
   while (true)
   {
     const std::uint32_t now_ms = static_cast<std::uint32_t>(osKernelSysTick());
-
-    // ---- ⓪' CAN2 排空 + 底盘帧 → 失能请求 / 链路状态 / 跟随请求 ----
-    // 必须放在控制层之前，让本周期 ⓪ 的失能判定立刻用上最新状态。
-    poll_chassis_can();
-
-    const bool estop_by_frame = g_estop_seen && (now_ms - g_estop_stamp_ms) < k_estop_timeout_ms;
-    const bool beat_fresh =
-        g_chassis_heartbeat_seen && (now_ms - g_heartbeat_stamp_ms) < k_chassis_link_timeout_ms;
-    g_chassis_online = beat_fresh;
-
-    // 载荷只在链路有效时采信：链路断了就冻结上一次的状态，不制造假的边沿
-    // （否则 0x124 一丢，云台会以为"上档结束"而突然退出跟随）。
-    if (beat_fresh)
-      g_chassis_follow_cmd = (g_chassis_state_bits & k_chassis_bit_auto_done) != 0U;
-
-    // 失能有两条独立通路：0x123 快路径 + 0x124 载荷位，任一为真即失能。
-    g_chassis_disable_cmd =
-        estop_by_frame ||
-        (beat_fresh && (g_chassis_state_bits & k_chassis_bit_estop) != 0U);
 
     // ---- ⓪ 控制层：每 1 ms 刷新一次目标 / 使能 ----
     // 放在最前面，使本周期 ③ 的角度环立刻用到最新目标。

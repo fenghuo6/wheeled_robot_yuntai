@@ -4,26 +4,24 @@
 #include "laser_task.hpp"
 #include "motor_task/motor_task.hpp"
 #include "score_detect.hpp"
-#include "trajectory_task/trajectory_task.hpp"
 
-// 阻塞发送(use_dma = false)：一帧 10 通道 = 42 字节 @921600 约 0.5ms，100Hz 下占用很小。
+// 阻塞发送(use_dma = false)：一帧 7 通道 = 31 字节 @921600 约 0.3ms，100Hz 下占用很小。
 // 不走 DMA 是避免上一帧未发完时 HAL 返回 HAL_BUSY 而整帧被静默丢弃，导致上位机一条数据都没有。
 sp::Plotter plotter(&huart1, false);
 
 // ============================================================================
-// 通道分配（10 通道）
-//   1 a 实际角(°) | 2 b 实际角(°) | 3 c 实际角(°)
-//   4 IMU 实际 yaw(°) | 5 IMU 实际 pitch(°)
-//   6 轨迹 yaw(°) | 7 轨迹 pitch(°)
-//   8 yaw 命中率(0~1,比赛计分) | 9 pitch 命中率(0~1,比赛计分)
-//   10 红外距离(cm)
+// 通道分配（7 通道）
+//   1 yaw 命中率(0~1,比赛计分) | 2 pitch 命中率(0~1,比赛计分)
+//   3 yaw 目标值(°)            | 4 pitch 目标值(°)
+//   5 yaw 实际值(°, IMU)       | 6 pitch 实际值(°, IMU)
+//   7 红外距离(cm)
 //
-// 实际角是相对本次使能位置的角（使能瞬间为 0），折叠时通道 2 从 0 升到
-//   g_cfg_fold_deg 再回 0。
-// 轨迹是 trajectory_task 输出的世界系角度，未加 yaw 平移偏置；
-//   电机实际在追的目标 = 该值 + g_yaw_offset，所以与 IMU 读数可能差一个常量。
-// 命中率是比赛计分程序的输出：|误差| < 容差(0.5°/1.5°) 的时间占比，
-//   只在轨迹跟随阶段累积，非跟随阶段读数为 0。
+// 目标值取 g_gimbal_yaw_set / g_gimbal_pitch_set —— 这是云台"真正在追"的角度
+//   （对齐阶段是限速斜坡、跟随时是轨迹点），命中率也是拿它和实际值比较的，
+//   所以 3/5 与 1、4/6 与 2 可以直接对照着看：目标与实际贴合得越紧，命中率越高。
+// 实际值取 IMU 世界系姿态（g_yaw_rad / g_pitch_rad）。
+// 命中率只在轨迹跟随阶段累积（对齐阶段误差恒 0，不统计），非跟随阶段读数停在最后一次。
+// 红外距离单位 cm（该模块实测按整数厘米上报），离线时保持上一次的有效值。
 // ============================================================================
 namespace
 {
@@ -37,12 +35,9 @@ extern "C" void plotter_task(void const *argument)
 
   while (1)
   {
-    // 一次取一组自洽的轨迹值（内部有临界区保护），避免 yaw/pitch 来自不同周期。
-    const TrajectoryPoint traj = trajectory_read();
     plotter.plot(
-      g_motor_a_angle_rel * k_rad_to_deg, g_motor_b_angle_rel * k_rad_to_deg,
-      g_motor_c_angle_rel * k_rad_to_deg, g_yaw_rad * k_rad_to_deg, g_pitch_rad * k_rad_to_deg,
-      traj.yaw * k_rad_to_deg, traj.pitch * k_rad_to_deg, g_yaw_fire_ratio, g_pitch_fire_ratio,
+      g_yaw_fire_ratio, g_pitch_fire_ratio, g_gimbal_yaw_set * k_rad_to_deg,
+      g_gimbal_pitch_set * k_rad_to_deg, g_yaw_rad * k_rad_to_deg, g_pitch_rad * k_rad_to_deg,
       static_cast<float>(g_gy56_distance_cm));
     osDelay(k_sample_period_ms);
   }

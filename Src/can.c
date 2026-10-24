@@ -146,8 +146,9 @@ void HAL_CAN_MspInit(CAN_HandleTypeDef* canHandle)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF9_CAN2;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-    /* 不使能 CAN2_RX0/RX1 中断：这一路用 1 ms 轮询接收（见 motor_task.cpp）。
-       若以后改成中断接收，在这里打开 NVIC 并在 stm32f4xx_it.c 里加处理函数。 */
+    /* 不使能 CAN2_RX0/RX1 中断：CAN2 目前没有被应用层使用（底盘链路已改为独立遥控器），
+       保留初始化是为了以后按需启用。若改成中断接收，在这里打开 NVIC 并在
+       stm32f4xx_it.c 里加处理函数。 */
   /* USER CODE BEGIN CAN2_MspInit 1 */
 
   /* USER CODE END CAN2_MspInit 1 */

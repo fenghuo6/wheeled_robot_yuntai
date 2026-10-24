@@ -128,23 +128,20 @@ extern volatile uint32_t g_can1_b_frames;
 extern volatile uint32_t g_can1_id_slot[8];
 extern volatile uint32_t g_can1_id_count[8];
 
-// ─────────────────── 4.3 底盘链路状态（只读） ───────────────────
-// 底盘 C 板发两帧，只在 CAN2（板间专用链路）上接收，CAN1 不再处理任何底盘帧：
-//   0x123  失能快路径：只在遥控器下档/断线期间发，200 Hz，数据全 0；
-//          "最近 100 ms 内收到过" = 要求云台失能。
-//   0x124  状态心跳：100 Hz 常发，载荷携带完整状态，是 C 板在线的唯一凭据；
-//          data[0] = 0xA5 魔数；
-//          data[1] = bit0 要求失能（与 0x123 同义）| bit1 上档跑完请求跟随。
-// "上档跑完"用状态位而不是事件帧：丢任意一帧都由下一帧补上，接收端无需重发/应答。
-// 只有 0x123 时无法区分"底盘正常"和"底盘没接上"，所以链路判断必须靠 0x124。
-extern volatile bool g_chassis_disable_cmd;  // 0x123 || 0x124.bit0：要求失能
-extern volatile bool g_chassis_online;       // 0x124：C 板在线（100 ms 内收到过）
-// 上电后是否收到过至少一帧 0x124（自锁存）。fail-safe 档位 1 的武装条件：
-// 只在"曾经连上过 C 板"之后才生效，避免单板调试时云台永久失能。
+// ─────────────────── 4.3 遥控器 / 失能 / 跟随开关（只读） ───────────────────
+// 信号来自独立遥控器接收机（DBus，USART3），由 uart_task 每 10 ms 解析：
+//   右开关 UP   → 请求自动跟随（yaw + pitch）
+//   右开关 MID  → 退出跟随
+//   右开关 DOWN → 要求失能（优先级最高）
+// CAN1 / CAN2 上都不再有底盘协议帧。
+extern volatile bool g_chassis_disable_cmd;  // 右开关 DOWN：要求失能
+extern volatile bool g_chassis_follow_cmd;   // 右开关 UP：测试档，立刻跟随 yaw+pitch
+extern volatile bool g_chassis_auto_cmd;     // 右开关 MID：自动档，折叠完成后延时跟随
+extern volatile bool g_chassis_online;       // 接收机在线（100 ms 内收到过有效 DBus 帧）
+// 上电后是否收到过至少一帧 DBus（自锁存）。fail-safe 档位 1 的武装条件：
+// 只在"曾经连上过接收机"之后才生效，避免单板调试时云台永久失能。
 extern volatile bool g_chassis_heartbeat_seen;
-// 0x124.bit1：上档跑完、请求跟随（电平，链路中断时冻结上一次的值）。
-extern volatile bool g_chassis_follow_cmd;
-// 心跳丢失后的处理策略在 motor_control.cpp 的 ①（见 g_cfg_chassis_link）。
+// 接收机丢失后的处理策略在 motor_control.cpp 的 ①（见 g_cfg_chassis_link）。
 
 // ─────────────────────── 4.2 折叠轴重力前馈（读写） ───────────────────────
 // 折叠轴在竖直平面内摆动, 重力矩随角度变化: τ(θ) = m·g·r·cos(θ - θ0)。

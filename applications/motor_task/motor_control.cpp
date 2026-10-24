@@ -88,17 +88,19 @@
 //       理由：IMU 装在折叠关节下游，b 一动世界系姿态就整体变化，此时跟随没有意义。
 //       单轴掉线不影响另一轴：track_a / track_c 是分开判定的。
 //
-// 底盘触发（已实现）：底盘上档自动行驶 3.5 m 跑完且车轮停稳后，0x124 载荷的 bit1 置 1，
-// 本文件的 ⓪ 在电平跳变时自动调用 motor_all_track(true)；离开上档后该位清 0，
-// ⓪ 随之调用 motor_all_track(false) 退出跟随。应用层不需要再写触发逻辑。
+// 自动跟随开关（遥控器右开关，已在 uart_task 里接好）：
+//   上档 UP   → g_chassis_follow_cmd = 1（测试档）→ 本文件 ⓪ 立刻 motor_all_track(true)
+//   中档 MID  → g_chassis_auto_cmd   = 1（自动档）→ 折叠复位完成后延时
+//               g_cfg_auto_follow_delay_ms（默认 3000ms）再跟随
+//   下档 DOWN → 两个都是 0 + 总失能（见下面的功能 3）
+// ⓪ 是边沿触发，开关停在某一档不会反复重启对齐。
 //
 // ─────────────────────────── 功能 3：总失能 ───────────────────────────
-// 场景：遥控器失能（遥控器接在底盘 C 板上，通过 CAN 传过来）。
-// 两条通路都已在 motor_task 里接好，本层 update 直接把结果并进失能判定，
-// 无需应用层调用：
-//   0x123（下档/断线时 200 Hz，快路径）+ 0x124.bit0 → g_chassis_disable_cmd；
-//   0x124（所有状态 100 Hz）                        → g_chassis_online，丢失即判不在线。
-// 链路丢失是否失能由 g_cfg_chassis_link 决定（0=不保护 1=收到过心跳后武装 2=始终武装）。
+// 场景：独立遥控器接收机（DBus，USART3）的右开关拨到底。
+// 通路已在 uart_task 里接好，本层 update 直接把结果并进失能判定，无需应用层调用：
+//   sw_r == DOWN      → g_chassis_disable_cmd（10 ms 刷新一次）
+//   接收机 100 ms 无帧 → g_chassis_online = false
+// 接收机丢失是否失能由 g_cfg_chassis_link 决定（0=不保护 1=收到过帧后武装 2=始终武装）。
 // 需要软件自行失能时仍可调用本接口：
 //
 //   motor_disable(true);               // 三个轴全部停止输出（b 也松）
@@ -125,7 +127,7 @@
 //   g_fold_reset_err_deg     复位完成时实际偏差(°)（诊断，读它就知道差多少）
 //   g_fold_settling          1 = 复位微调中（诊断；此期间 b 轴积分分离被关掉）
 //   ── 红外触发 ──
-//   g_cfg_ir_trigger_cm      ★距离阈值(cm)     默认 30，0 = 关闭红外触发
+//   g_cfg_ir_trigger_cm      ★距离阈值(cm)     默认 50，0 = 关闭红外触发
 //   ── 轨迹跟随 ──
 //   g_cfg_untracked_hold_axes 不跟随时 a/c 顶住  默认 false
 //   g_cfg_align_rate_dps     对齐限速(°/s)      默认 23
@@ -355,15 +357,16 @@ namespace
   }
 
   // ─────────────────────── 3.1 红外遮挡 → 折叠并复位一次 ───────────────────────
-  // 触发条件：GY-56 在线、测距状态可靠、距离 < g_cfg_ir_trigger_cm（0 = 关闭）。
+  // 触发条件：GY-56 在线、测距状态可靠、距离 < g_cfg_ir_trigger_cm（0 = 关闭）、
+  //           且当前没有在跟随（自动/测试跟随期间关闭折叠，见下面的说明）。
   // 一次序列 = 折叠 → 停留 g_cfg_fold_hold_ms → 复位，全部由上面的状态机完成；
   // 本函数只负责"发起请求"和"序列结束后解锁"，不需要应用层再写触发代码。
   // 序列结束后不自动开始轨迹跟随（跟随请求由应用层/示例区决定）。
   // 上电不会自己折叠：唯一的触发源是红外（或应用层直接调 motorB_fold_enable）。
   // 要求 g_cfg_fold_hold_ms > 0（默认 3000），否则折叠后不会自动复位，序列停在保持位。
   //
-  // 重新武装有回差：必须离开"阈值 + k_ir_release_cm"才允许下一次触发，
-  // 否则目标停在 30cm 附近时，会在阈值上下反复折叠、反复触发。
+  // 重新武装有回差：必须离开"阈值 + k_ir_release_cm"（默认 55cm）才允许下一次触发，
+  // 否则目标停在阈值附近时，会在阈值上下反复折叠、反复触发。
   constexpr uint16_t k_ir_release_cm = 5U;
   bool g_ir_armed = true;    // true = 允许触发下一次
   bool g_ir_folding = false; // true = 已发起折叠序列，等它复位完成
@@ -393,6 +396,17 @@ namespace
       }
       return;
     }
+
+    // ── 跟随时关闭折叠功能 ──
+    // 跟随（自动档/测试档）期间不让红外触发折叠：正在跟踪时被手/障碍触发一次
+    // 折叠 → 折叠期间必须停止跟随（IMU 在折叠关节下游）→ 跟踪被打断、命中率清零，
+    // 而且回来还要重新对齐，表现为"跟得好好的突然停一下"。
+    // 判断用"跟随请求"而不是 g_traj_following：折叠期间 busy 会把 g_traj_following 拉低，
+    // 用它判断会导致折叠刚启动就"不满足条件"，逻辑自相矛盾。
+    // 不动 g_ir_armed：退出跟随后本函数立即恢复工作，遮挡条件满足就照常触发，
+    // 行为与"从没来过跟随"完全一致，不会留下隐藏状态。
+    if (g_req_track_a || g_req_track_c)
+      return;
 
     // 未触发：等障碍离开后再武装。
     // 注意"离开"有两种表现：距离变大（> 阈值+回差），或者根本测不到（超量程/信号弱/
@@ -562,16 +576,18 @@ volatile uint32_t g_cfg_fold_settle_timeout_ms = 3000U;
 volatile float g_fold_reset_err_deg = 0.0f;
 volatile bool g_cfg_untracked_hold_axes = false;
 // 红外触发阈值(cm)，0 = 关闭。实际使用见 motor_control_update() 的示例 8。
-volatile uint16_t g_cfg_ir_trigger_cm = 30U;
+volatile uint16_t g_cfg_ir_trigger_cm = 50U;
+// 遥控器中档（自动档）的跟随延时(ms)：折叠复位完成后等这么久再开始跟随。默认 3000。
+volatile uint32_t g_cfg_auto_follow_delay_ms = 3000U;
 volatile float g_cfg_align_rate_dps = 23.0f;
 volatile float g_cfg_align_tolerance_deg = 3.0f;
 volatile uint32_t g_cfg_align_timeout_ms = 4000U;
-// 底盘心跳（CAN 0x124）丢失的处理策略，三档。默认 0。
+// 遥控接收机（DBus）丢失的处理策略，三档。默认 0。
 //   0 = 不做链路保护，云台完全按自己的状态工作（与加这套功能之前一致，单板可用）。
-//   1 = 上电后收到过心跳才武装（g_chassis_heartbeat_seen）；此后心跳丢失 → 失能。
-//       底盘没接/没上电/没刷心跳固件时不会把云台锁死，日常调试与比赛都适用。
-//   2 = 始终武装：收不到心跳就失能，包括"开机前线就断了"。
-//       比赛用这一档；代价是云台单独上电时 b 轴不顶，云台臂会因重力下垂。
+//   1 = 上电后收到过接收机数据才武装（g_chassis_heartbeat_seen）；此后掉线 → 失能。
+//       没插接收机时不会把云台锁死，日常调试与比赛都适用。
+//   2 = 始终武装：收不到接收机数据就失能，包括"开机前线就断了"。
+//       代价是云台单独上电时 b 轴不顶，云台臂会因重力下垂。
 volatile uint8_t g_cfg_chassis_link = 0U;
 
 // 红外遮挡触发的完成次数（诊断）：每走完一次"遮挡→折叠→停留→复位"序列 +1。
@@ -629,36 +645,68 @@ void motor_control_update(void)
     return;
   }
 
-  // ---- ⓪ 底盘"上档跑完"状态位 → 开始 / 停止跟随 ----
-  // g_chassis_follow_cmd 是 0x124 载荷里的 bit1（电平），底盘每 10 ms 刷新一次：
-  //   上档跑完且车轮停稳 → 1（开始跟随）；离开上档 → 0（退出跟随）。
+  // ---- ⓪ 遥控器右开关 → 开始 / 停止自动跟随 ----
+  // 三个档位的语义（uart_task 每 10 ms 刷新两个电平量）：
+  //   UP   测试档（g_chassis_follow_cmd）：立刻跟随，用于验证整条链路是否完整。
+  //   MID  自动档（g_chassis_auto_cmd）：等折叠复位完成（g_fold_phase == 4）后，
+  //        再延时 g_cfg_auto_follow_delay_ms（默认 3000 ms）才跟随；没折过就不跟随。
+  //   DOWN 失能档：两个量都为 0，跟随请求清零，由下面的 ① 全松（优先级最高）。
   // 只在电平变化时动作一次：
-  //   · 电平语义：丢帧不会漏掉，重复帧也不会重复触发；
-  //   · 边沿语义：不会把上层之后主动 motor_all_track(true/false) 的意图每 10 ms 覆盖回去。
+  //   · 电平语义：重复写同一值不会重复触发；
+  //   · 边沿语义：不会把上层之后主动 motor_all_track(true/false) 的意图每周期覆盖回去。
   // 放在 ① 之前：失能期间收到的信号也照常记成"跟随请求"（与 motor_disable 的语义一致，
   // 解除失能后重新对齐再开始跟随），不会被安全逻辑吞掉。
-  static bool follow_cmd_prev = false;
-  if (g_chassis_follow_cmd != follow_cmd_prev)
+  static bool auto_fold_seen = false;     // 自动档：本次折叠是否已完成（每次新折叠重新计时）
+  static uint32_t auto_fold_done_ms = 0U; // 自动档：折叠复位完成的时刻
+  bool want_follow = false;
+  if (g_chassis_follow_cmd)
   {
-    motor_all_track(g_chassis_follow_cmd);
-    follow_cmd_prev = g_chassis_follow_cmd;
+    want_follow = true; // UP：测试档，立刻跟随
+  }
+  else if (g_chassis_auto_cmd)
+  {
+    if (g_fold_phase == 4U) // 折叠 + 复位 + settle 全部完成
+    {
+      if (!auto_fold_seen)
+      {
+        auto_fold_seen = true;
+        auto_fold_done_ms = now_ms;
+      }
+      want_follow = (now_ms - auto_fold_done_ms) >= g_cfg_auto_follow_delay_ms;
+    }
+    else
+    {
+      // 还没折过，或又折了一次（阶段回到 1/2/3）：重新计时，期间不跟随。
+      auto_fold_seen = false;
+      want_follow = false;
+    }
+  }
+  else
+  {
+    auto_fold_seen = false;
+  }
+
+  static bool want_follow_prev = false;
+  if (want_follow != want_follow_prev)
+  {
+    motor_all_track(want_follow);
+    want_follow_prev = want_follow;
   }
 
   // ---- ① 总失能：最高优先级，三个轴全松 ----
   // 失能就是彻底不出力，避免堵转发热。代价是云台会因重力下垂（三个关节都没有抱闸）。
-  // 三个来源并联，任一为真即失能：
+  // 四个来源并联，任一为真即失能：
   //   g_req_disable            本层 API（motor_disable）
-  //   g_chassis_disable_cmd    底盘遥控器下档，由 motor_task 从 CAN 0x123 还原（100 ms 超时）
-  //   g_cfg_chassis_link == 1 && 曾收到过心跳 && !g_chassis_online
+  //   g_chassis_disable_cmd    遥控器右下开关在 DOWN 位（uart_task 每 10 ms 刷新）
+  //   g_cfg_chassis_link == 1 && 曾收到过 DBus 帧 && !g_chassis_online
   //   g_cfg_chassis_link == 2 && !g_chassis_online
-  //                            底盘心跳（CAN 0x124）丢失 → fail-safe 失能
-  // 【为什么必须有心跳这一路】0x123 只在失能时发，所以"收不到 0x123"既可能是
-  //   "底盘正常行驶"，也可能是"C 板没接上/线断了"。只有常发的 0x124 能把这两种情况分开；
-  //   否则线一断，遥控器下档就静默失效，操作手按了也不会松手。
-  // 【为什么分三档】云台物理上无法区分"底盘正常但没说话"和"底盘不在"，只能由配置决定：
+  //                            遥控接收机掉线 → fail-safe 失能
+  // 【为什么要链路保护】失能信号来自接收机，接收机一旦掉线就收不到开关状态；
+  //   不保护的话线一断、操作手拨到底也不会松手。
+  // 【为什么分三档】云台无法区分"接收机正常但没接"和"接收机本来就没插"，只能由配置决定：
   //   0 = 不保护（单板调试，与加这套功能之前完全一致）；
-  //   1 = 上电收到过心跳之后才武装（日常；底盘没接也不会把云台锁死在失能）；
-  //   2 = 始终武装（比赛；开机前线就断也保护，代价是"没接底盘 = 云台不出力"）。
+  //   1 = 上电收到过 DBus 帧之后才武装（日常；没插接收机也不会把云台锁死在失能）；
+  //   2 = 始终武装（比赛；开机前线就断也保护，代价是"没接接收机 = 云台不出力"）。
   const bool link_lost =
       (g_cfg_chassis_link == 2U) ? !g_chassis_online
       : (g_cfg_chassis_link == 1U) ? (g_chassis_heartbeat_seen && !g_chassis_online)
@@ -795,24 +843,29 @@ void motor_control_update(void)
   //   解除：motor_disable(false);
 
   // ── 示例 8：红外测距触发折叠（已实现，无需再写代码）
-  //   阈值 g_cfg_ir_trigger_cm（默认 30cm，0 = 关闭），调试器里可改。
+  //   阈值 g_cfg_ir_trigger_cm（默认 50cm，0 = 关闭），调试器里可改。
   //   距离小于阈值就自动跑一次"折叠 → 停留 g_cfg_fold_hold_ms → 复位"，
   //   逻辑在 ③ 前的 ir_fold_update()：序列完成才解锁，障碍离开后重新武装，
   //   所以每次"靠近 → 离开 → 再靠近"都会再折一次（g_ir_fold_count 可看次数）。
   //   "离开"= 距离 > 阈值+5cm 或 测不到（超量程/信号弱/离线）。
+  //   跟随时不折叠：自动档/测试档跟随期间红外被屏蔽，退出跟随后立即恢复。
   //   只折叠不跟随：需要跟随时在示例 1/2/3 里放开对应行。
   //   前提：g_gy56_online 且测距状态可靠（避免掉线/超量程时用旧值误触发）。
 
-  // ── 示例 9：底盘 CAN 遥控器失能（已实现，无需再写代码）
-  //   协议：底盘在遥控器下档（失能）期间每 1 ms 发标准帧 0x123，解除后停发。
-  //   motor_task 收到后把 g_chassis_disable_cmd 置 true，100 ms 无帧自动清 false，
-  //   本函数开头的 ① 已经把该标志并进总失能判定（失能 > 折叠 > 跟随），
-  //   所以失能期间这里根本不会执行到，无需再额外 return。
+  // ── 示例 9：遥控器失能（已实现，无需再写代码）
+  //   独立遥控器接收机（DBus，USART3）的右开关拨到底（DOWN）→ 要求失能。
+  //   uart_task 每 10 ms 解析开关，写入 g_chassis_disable_cmd；接收机 100 ms 无帧
+  //   则 g_chassis_online = false。本函数开头的 ① 已把这两路并进总失能判定
+  //   （失能 > 折叠 > 跟随），所以失能期间这里根本不会执行到，无需再额外 return。
 
-  // ── 示例 10：底盘上档跑完 → 开始跟随 / 离开上档 → 停止跟随（已实现）
-  //   跑完 3.5 m 且车轮停稳后，0x124 载荷 bit1 置 1；离开上档自动清 0。
-  //   motor_task 把它解成 g_chassis_follow_cmd，本函数开头的 ⓪ 在跳变时调用
-  //   motor_all_track(true/false)，开始跟随后照 ④ 的流程先对齐再跟随。
+  // ── 示例 10：遥控器右开关三档（已实现，无需再写代码）
+  //   上档 UP   → g_chassis_follow_cmd = 1：测试档，立刻调用 motor_all_track(true)，
+  //              用于验证"失能/折叠/跟随"整条链路是否完整。
+  //   中档 MID  → g_chassis_auto_cmd   = 1：自动档，等折叠复位完成（g_fold_phase == 4）
+  //              后延时 g_cfg_auto_follow_delay_ms（默认 3000 ms）再开始跟随；
+  //              没折过就不跟随，再折一次会重新计时。
+  //   下档 DOWN → g_chassis_disable_cmd= 1：失能（见示例 9），优先级最高。
+  //   ⓪ 是边沿触发：开关保持在某一档不会反复重启对齐；跟随时照 ④ 的流程先限速对齐。
 
   // ── 示例 11：上电自动折叠 —— 已移除
   //   上电不再自己折叠，唯一触发源是红外（见示例 8）。

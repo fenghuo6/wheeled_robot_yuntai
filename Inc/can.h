@@ -33,7 +33,8 @@ extern "C" {
 /* USER CODE END Includes */
 
 extern CAN_HandleTypeDef hcan1;
-/* CAN2：板间专用链路，接收底盘的状态帧（PB5/PB6）。
+/* CAN2（PB5/PB6）：目前未被应用层使用 —— 底盘链路已改为独立遥控器（DBus, USART3）。
+   初始化保留，方便以后按需启用（例如再接一路板间通信）。
    注意：这一路是手工加进 CubeMX 生成代码的，若之后重新生成代码，
    需要在 CubeMX 里勾上 CAN2（PB5=RX, PB6=TX, 1 Mbps）否则会被覆盖。 */
 extern CAN_HandleTypeDef hcan2;
